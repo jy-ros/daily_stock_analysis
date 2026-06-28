@@ -2,6 +2,7 @@
 import unittest
 import sys
 import os
+import sqlite3
 import tempfile
 import threading
 from datetime import date
@@ -15,9 +16,192 @@ from sqlalchemy.sql import func
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.config import Config
-from src.storage import Base, DatabaseManager, StockDaily
+from src.storage import Base, CURRENT_SCHEMA_VERSION, DatabaseManager, DatabaseSchemaMigration, StockDaily
 
 class TestStorage(unittest.TestCase):
+
+    @staticmethod
+    def _list_sqlite_unique_indexes(db_path: str, table_name: str) -> dict[str, list[str]]:
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute(f"PRAGMA index_list({table_name})").fetchall()
+            unique_indexes = {}
+            for row in rows:
+                if int(row[2]) != 1:
+                    continue
+                index_name = row[1]
+                index_columns = []
+                for index_info in conn.execute(f"PRAGMA index_xinfo({index_name})").fetchall():
+                    column_name = index_info[2]
+                    if column_name is not None:
+                        index_columns.append(column_name)
+                unique_indexes[index_name] = index_columns
+            return unique_indexes
+
+    def test_legacy_intelligence_items_url_unique_index_rebuilds_without_collision(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        db_path = os.path.join(temp_dir.name, "legacy_intel.sqlite")
+
+        try:
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    """CREATE TABLE intelligence_sources (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    source_type TEXT NOT NULL DEFAULT 'rss',
+                    url TEXT NOT NULL,
+                    scope_type TEXT NOT NULL DEFAULT 'market',
+                    scope_value TEXT,
+                    market TEXT NOT NULL DEFAULT 'cn',
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    last_status TEXT,
+                    last_error TEXT,
+                    last_fetched_at DATETIME,
+                    created_at DATETIME,
+                    updated_at DATETIME
+                )"""
+                )
+                conn.execute(
+                    """CREATE TABLE intelligence_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_id INTEGER,
+                    source_name TEXT,
+                    source_type TEXT NOT NULL DEFAULT 'rss',
+                    title TEXT NOT NULL,
+                    summary TEXT,
+                    url TEXT NOT NULL,
+                    source TEXT,
+                    published_at DATETIME,
+                    fetched_at DATETIME,
+                    scope_type TEXT NOT NULL DEFAULT 'market',
+                    scope_value TEXT,
+                    market TEXT NOT NULL DEFAULT 'cn',
+                    raw_payload TEXT
+                )"""
+                )
+                conn.execute("CREATE UNIQUE INDEX uix_intelligence_item_url_legacy ON intelligence_items(url)")
+                conn.execute("CREATE INDEX ix_intel_item_scope_time ON intelligence_items(scope_type, scope_value, market, published_at)")
+                conn.execute("CREATE INDEX ix_intel_item_fetch_time ON intelligence_items(fetched_at)")
+                conn.execute("INSERT INTO intelligence_sources (name, url) VALUES ('legacy', 'https://legacy.example.com/rss.xml')")
+                source_id = conn.execute("SELECT id FROM intelligence_sources WHERE name='legacy'").fetchone()[0]
+                conn.executemany(
+                    """INSERT INTO intelligence_items (
+                    source_id,
+                    source_name,
+                    source_type,
+                    title,
+                    summary,
+                    url,
+                    source,
+                    published_at,
+                    fetched_at,
+                    scope_type,
+                    scope_value,
+                    market,
+                    raw_payload
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    [
+                        (source_id, 'legacy-source', 'rss', 'A', 'legacy-a', 'https://legacy.example.com/a', 'legacy',
+                         '2026-01-01 00:00:00', '2026-01-01 00:00:00', 'market', None, 'cn', None),
+                        (source_id, 'legacy-source', 'rss', 'B', 'legacy-b', 'https://legacy.example.com/b', 'legacy',
+                         '2026-01-02 00:00:00', '2026-01-02 00:00:00', 'market', None, 'cn', None),
+                    ],
+                )
+
+            unique_indexes_before = self._list_sqlite_unique_indexes(db_path, "intelligence_items")
+            self.assertIn("uix_intelligence_item_url_legacy", unique_indexes_before)
+            self.assertEqual(unique_indexes_before["uix_intelligence_item_url_legacy"], ["url"])
+
+            DatabaseManager.reset_instance()
+            Config.reset_instance()
+            DatabaseManager(db_url=f"sqlite:///{db_path}")
+
+            unique_indexes_after = self._list_sqlite_unique_indexes(db_path, "intelligence_items")
+            self.assertNotIn("uix_intelligence_item_url_legacy", unique_indexes_after)
+            self.assertIn("uix_intel_item_scope", unique_indexes_after)
+            self.assertEqual(
+                unique_indexes_after["uix_intel_item_scope"],
+                ["source_id", "url", "scope_type", "scope_value", "market"],
+            )
+            with sqlite3.connect(db_path) as conn:
+                table_count = conn.execute("SELECT COUNT(*) FROM intelligence_items").fetchone()[0]
+                temp_tables = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'intelligence_items_recreate_tmp_%'"
+                ).fetchall()
+
+            self.assertEqual(table_count, 2)
+            self.assertEqual(temp_tables, [])
+        finally:
+            DatabaseManager.reset_instance()
+            Config.reset_instance()
+            temp_dir.cleanup()
+
+    def test_database_initialization_records_schema_version(self):
+        DatabaseManager.reset_instance()
+        db = DatabaseManager(db_url="sqlite:///:memory:")
+
+        with db.get_session() as session:
+            row = session.get(DatabaseSchemaMigration, CURRENT_SCHEMA_VERSION)
+
+        self.assertIsNotNone(row)
+        self.assertEqual(row.version, CURRENT_SCHEMA_VERSION)
+        self.assertIn("metadata.create_all", row.description)
+
+        DatabaseManager.reset_instance()
+
+    def test_schema_migration_record_is_idempotent(self):
+        DatabaseManager.reset_instance()
+        db = DatabaseManager(db_url="sqlite:///:memory:")
+
+        db._ensure_schema_migration_record()
+        db._ensure_schema_migration_record()
+
+        with db.get_session() as session:
+            count = session.execute(
+                select(func.count()).select_from(DatabaseSchemaMigration)
+            ).scalar_one()
+
+        self.assertEqual(count, 1)
+
+        DatabaseManager.reset_instance()
+
+    def test_schema_migration_record_handles_concurrent_initialization(self):
+        DatabaseManager.reset_instance()
+        temp_dir = tempfile.TemporaryDirectory()
+        db_path = os.path.join(temp_dir.name, "schema_migration_race.db")
+        db = DatabaseManager(db_url=f"sqlite:///{db_path}")
+        worker_count = 8
+        barrier = threading.Barrier(worker_count)
+        errors = []
+        state_lock = threading.Lock()
+
+        with db.get_session() as session:
+            session.query(DatabaseSchemaMigration).delete()
+            session.commit()
+
+        def ensure_record() -> None:
+            try:
+                barrier.wait(timeout=5)
+                db._ensure_schema_migration_record()
+            except Exception as exc:
+                with state_lock:
+                    errors.append(exc)
+
+        threads = [threading.Thread(target=ensure_record) for _ in range(worker_count)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        with db.get_session() as session:
+            rows = session.execute(select(DatabaseSchemaMigration)).scalars().all()
+
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].version, CURRENT_SCHEMA_VERSION)
+
+        DatabaseManager.reset_instance()
+        temp_dir.cleanup()
     
     def test_parse_sniper_value(self):
         """测试解析狙击点位数值"""
@@ -97,6 +281,225 @@ class TestStorage(unittest.TestCase):
         )
 
         self.assertEqual({item["session_id"] for item in sessions}, {"feishu_u1", "feishu_u1:ask_600519"})
+
+        DatabaseManager.reset_instance()
+
+    def test_conversation_summary_upsert_and_delete_with_session(self):
+        DatabaseManager.reset_instance()
+        db = DatabaseManager(db_url="sqlite:///:memory:")
+
+        db.save_conversation_message("summary-session", "user", "hello")
+        db.upsert_conversation_summary(
+            "summary-session",
+            "first summary",
+            covered_message_id=1,
+            source_message_count=1,
+            estimated_tokens=10,
+        )
+        db.upsert_conversation_summary(
+            "summary-session",
+            "updated summary",
+            covered_message_id=2,
+            source_message_count=2,
+            estimated_tokens=12,
+        )
+
+        summary = db.get_conversation_summary("summary-session")
+        self.assertIsNotNone(summary)
+        self.assertEqual(summary["summary"], "updated summary")
+        self.assertEqual(summary["covered_message_id"], 2)
+        self.assertEqual(summary["source_message_count"], 2)
+
+        deleted = db.delete_conversation_session("summary-session")
+
+        self.assertEqual(deleted, 1)
+        self.assertIsNone(db.get_conversation_summary("summary-session"))
+
+        DatabaseManager.reset_instance()
+
+    def test_conversation_message_save_returns_id(self):
+        DatabaseManager.reset_instance()
+        db = DatabaseManager(db_url="sqlite:///:memory:")
+
+        message_id = db.save_conversation_message("message-id-session", "user", "hello")
+
+        self.assertIsInstance(message_id, int)
+        self.assertGreater(message_id, 0)
+
+        DatabaseManager.reset_instance()
+
+    def test_provider_turn_round_trip_preserves_protocol_fields_and_flags(self):
+        DatabaseManager.reset_instance()
+        db = DatabaseManager(db_url="sqlite:///:memory:")
+        user_id = db.save_conversation_message("trace-session", "user", "question")
+        assistant_id = db.save_conversation_message("trace-session", "assistant", "final")
+        trace_messages = [
+            {
+                "role": "assistant",
+                "content": "checking",
+                "reasoning_content": "reasoning",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "name": "echo",
+                        "arguments": {"message": "hello"},
+                        "provider_specific_fields": {"thought_signature": "sig"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "{\"ok\": true}"},
+        ]
+
+        turn_id = db.save_agent_provider_turn(
+            session_id="trace-session",
+            run_id="run-1",
+            provider="deepseek",
+            model="deepseek/deepseek-chat",
+            anchor_user_message_id=user_id,
+            anchor_assistant_message_id=assistant_id,
+            messages=trace_messages,
+            contains_reasoning=True,
+            contains_tool_calls=True,
+            contains_thinking_blocks=False,
+            must_roundtrip=True,
+            estimated_tokens=42,
+        )
+        rows = db.get_agent_provider_turns("trace-session")
+
+        self.assertIsInstance(turn_id, int)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["messages"], trace_messages)
+        self.assertTrue(rows[0]["contains_reasoning"])
+        self.assertTrue(rows[0]["contains_tool_calls"])
+        self.assertTrue(rows[0]["must_roundtrip"])
+        self.assertEqual(rows[0]["estimated_tokens"], 42)
+
+        DatabaseManager.reset_instance()
+
+    def test_provider_turns_do_not_appear_in_visible_or_web_messages_and_delete_with_session(self):
+        DatabaseManager.reset_instance()
+        db = DatabaseManager(db_url="sqlite:///:memory:")
+        user_id = db.save_conversation_message("trace-hidden", "user", "visible question")
+        assistant_id = db.save_conversation_message("trace-hidden", "assistant", "visible answer")
+        db.save_agent_provider_turn(
+            session_id="trace-hidden",
+            run_id="run-hidden",
+            provider="deepseek",
+            model="deepseek/deepseek-chat",
+            anchor_user_message_id=user_id,
+            anchor_assistant_message_id=assistant_id,
+            messages=[{"role": "assistant", "reasoning_content": "SECRET_REASONING", "tool_calls": []}],
+            contains_reasoning=True,
+            contains_tool_calls=True,
+            contains_thinking_blocks=False,
+            must_roundtrip=True,
+            estimated_tokens=5,
+        )
+
+        self.assertEqual(
+            [(m["role"], m["content"]) for m in db.get_visible_conversation_messages("trace-hidden")],
+            [("user", "visible question"), ("assistant", "visible answer")],
+        )
+        self.assertEqual(
+            [(m["role"], m["content"]) for m in db.get_conversation_history("trace-hidden")],
+            [("user", "visible question"), ("assistant", "visible answer")],
+        )
+        self.assertEqual(
+            [(m["role"], m["content"]) for m in db.get_conversation_messages("trace-hidden")],
+            [("user", "visible question"), ("assistant", "visible answer")],
+        )
+
+        deleted = db.delete_conversation_session("trace-hidden")
+
+        self.assertEqual(deleted, 2)
+        self.assertEqual(db.get_agent_provider_turns("trace-hidden"), [])
+
+        DatabaseManager.reset_instance()
+
+    def test_provider_turn_retention_is_bucketed_by_session_provider_model(self):
+        DatabaseManager.reset_instance()
+        db = DatabaseManager(db_url="sqlite:///:memory:")
+        for idx in range(5):
+            user_id = db.save_conversation_message("retention", "user", f"q{idx}")
+            assistant_id = db.save_conversation_message("retention", "assistant", f"a{idx}")
+            db.save_agent_provider_turn(
+                session_id="retention",
+                run_id=f"run-{idx}",
+                provider="deepseek",
+                model="deepseek/deepseek-chat",
+                anchor_user_message_id=user_id,
+                anchor_assistant_message_id=assistant_id,
+                messages=[{"role": "assistant", "reasoning_content": f"r{idx}", "tool_calls": [{"id": f"c{idx}", "name": "echo", "arguments": {}}]}],
+                contains_reasoning=True,
+                contains_tool_calls=True,
+                contains_thinking_blocks=False,
+                must_roundtrip=True,
+                estimated_tokens=idx + 1,
+            )
+        user_id = db.save_conversation_message("retention", "user", "other")
+        assistant_id = db.save_conversation_message("retention", "assistant", "other")
+        db.save_agent_provider_turn(
+            session_id="retention",
+            run_id="run-other",
+            provider="anthropic",
+            model="anthropic/claude-test",
+            anchor_user_message_id=user_id,
+            anchor_assistant_message_id=assistant_id,
+            messages=[{"role": "assistant", "provider_blocks": [{"type": "thinking"}], "tool_calls": [{"id": "c-other", "name": "echo", "arguments": {}}]}],
+            contains_reasoning=False,
+            contains_tool_calls=True,
+            contains_thinking_blocks=True,
+            must_roundtrip=True,
+            estimated_tokens=1,
+        )
+
+        deepseek_rows = db.get_agent_provider_turns(
+            "retention",
+            provider="deepseek",
+            model="deepseek/deepseek-chat",
+        )
+        anthropic_rows = db.get_agent_provider_turns(
+            "retention",
+            provider="anthropic",
+            model="anthropic/claude-test",
+        )
+
+        self.assertEqual(len(deepseek_rows), 3)
+        self.assertEqual([row["run_id"] for row in deepseek_rows], ["run-2", "run-3", "run-4"])
+        self.assertEqual(len(anthropic_rows), 1)
+
+        DatabaseManager.reset_instance()
+
+    def test_get_visible_conversation_messages_returns_ordered_visible_content(self):
+        DatabaseManager.reset_instance()
+        db = DatabaseManager(db_url="sqlite:///:memory:")
+
+        db.save_conversation_message("visible-session", "system", "hidden")
+        db.save_conversation_message("visible-session", "user", "question")
+        db.save_conversation_message("visible-session", "assistant", "answer")
+
+        messages = db.get_visible_conversation_messages("visible-session")
+
+        self.assertEqual(
+            [(item["role"], item["content"]) for item in messages],
+            [("user", "question"), ("assistant", "answer")],
+        )
+        self.assertIsInstance(messages[0]["id"], int)
+
+        DatabaseManager.reset_instance()
+
+    def test_get_visible_conversation_messages_limit_returns_ordered_tail(self):
+        DatabaseManager.reset_instance()
+        db = DatabaseManager(db_url="sqlite:///:memory:")
+
+        for idx in range(25):
+            db.save_conversation_message("visible-limit", "user", f"msg-{idx}")
+
+        messages = db.get_visible_conversation_messages("visible-limit", limit=20)
+
+        self.assertEqual(len(messages), 20)
+        self.assertEqual(messages[0]["content"], "msg-5")
+        self.assertEqual(messages[-1]["content"], "msg-24")
 
         DatabaseManager.reset_instance()
 

@@ -27,6 +27,7 @@ from src.agent.llm_adapter import (
     resolve_fallback_litellm_wire_models,
     register_fallback_model_pricing,
 )
+from src.agent.provider_trace import resolved_model_provider_identity
 from src.agent.skills.defaults import CORE_TRADING_SKILL_POLICY_ZH
 from src.config import (
     Config,
@@ -38,8 +39,45 @@ from src.config import (
     resolve_litellm_wire_model,
     resolve_news_window_days,
 )
+from src.llm.hermes import (
+    HERMES_CHANNEL_NAME,
+    build_hermes_redaction_values,
+    canonicalize_hermes_model_ref,
+    filter_non_hermes_deployments,
+    hermes_blocked_route_candidates,
+    is_masked_secret_placeholder,
+    open_hermes_no_proxy_client,
+    route_deployment_origins,
+    route_has_hermes,
+    sanitize_hermes_error_text,
+)
 from src.llm.generation_params import apply_litellm_generation_params
 from src.llm.errors import call_litellm_with_param_recovery
+from src.llm.backend_registry import (
+    CODEX_CLI_BACKEND_ID,
+    LITELLM_BACKEND_ID,
+    resolve_generation_backend_id,
+    resolve_generation_fallback_backend_id,
+)
+from src.llm.backend_factory import create_generation_backend
+from src.llm.generation_backend import (
+    GenerationBackend,
+    GenerationError,
+    GenerationErrorCode,
+)
+from src.llm.usage import (
+    attach_legacy_message_stability_audit,
+    attach_message_hmacs,
+    extract_usage_payload,
+    normalize_litellm_usage,
+    should_persist_usage_telemetry,
+)
+from src.llm.local_cli_backend import redact_diagnostic_text
+from src.llm.provider_cache import (
+    apply_prompt_cache_hints,
+    build_provider_cache_route_context,
+    filter_prompt_cache_telemetry,
+)
 from src.storage import persist_llm_usage
 from src.data.stock_mapping import STOCK_NAME_MAP
 from src.report_language import (
@@ -54,8 +92,11 @@ from src.report_language import (
     localize_confidence_level,
     normalize_report_language,
 )
+from src.schemas.decision_action import build_action_fields
 from src.schemas.report_schema import AnalysisReportSchema
-from src.market_context import get_market_role, get_market_guidelines
+from src.market_context import detect_market, get_market_role, get_market_guidelines
+from src.services.daily_market_context import format_daily_market_context_prompt_section
+from src.market_phase_prompt import format_market_phase_prompt_section
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +124,120 @@ def _normalize_risk_warning_values(value: Any) -> List[str]:
         return [text] if text else []
     text = str(value).strip()
     return [text] if text else []
+
+
+def _today_has_realtime_overlay(today: Any) -> bool:
+    if not isinstance(today, dict):
+        return False
+    data_source = today.get("data_source") or today.get("dataSource")
+    if isinstance(data_source, str) and data_source.startswith("realtime:"):
+        return True
+    if today.get("is_partial_bar") is True or today.get("isPartialBar") is True:
+        return True
+    if today.get("is_estimated") is True or today.get("isEstimated") is True:
+        return True
+    return bool(today.get("estimated_fields") or today.get("estimatedFields"))
+
+
+def _today_looks_complete_daily_bar(
+    context: Dict[str, Any],
+    phase_context: Dict[str, Any],
+) -> bool:
+    today = context.get("today")
+    if (
+        not isinstance(today, dict)
+        or today.get("close") in (None, "")
+        or _today_has_realtime_overlay(today)
+    ):
+        return False
+
+    effective_date = phase_context.get("effective_daily_bar_date")
+    today_date = today.get("date") or today.get("trade_date") or context.get("date")
+    if effective_date and today_date and str(today_date) != str(effective_date):
+        return False
+    return True
+
+
+def _phase_aware_quote_labels(context: Dict[str, Any]) -> Tuple[str, str]:
+    """Choose Chinese quote-table labels that do not conflict with phase context."""
+    phase_context = context.get("market_phase_context")
+    if not isinstance(phase_context, dict):
+        return "今日行情", "收盘价"
+
+    phase = str(phase_context.get("phase") or "").strip()
+    if phase in {"premarket", "non_trading"}:
+        today = context.get("today")
+        if _today_looks_complete_daily_bar(context, phase_context):
+            return "上一完整交易日行情", "上一完整交易日收盘价"
+        if _today_has_realtime_overlay(today):
+            return "最新行情", "实时估算价"
+        if isinstance(today, dict) and today.get("close") not in (None, ""):
+            return "最新行情", "最新价"
+        return "今日行情", "收盘价"
+
+    if (
+        phase in {"intraday", "lunch_break", "closing_auction"}
+        and phase_context.get("is_partial_bar") is True
+    ):
+        return "最新行情", "盘中估算价"
+
+    return "今日行情", "收盘价"
+
+
+def _should_hide_regular_session_ohlc(context: Dict[str, Any]) -> bool:
+    phase_context = context.get("market_phase_context")
+    if not isinstance(phase_context, dict):
+        return False
+
+    phase = str(phase_context.get("phase") or "").strip()
+    return phase in {"premarket", "non_trading"} and not _today_looks_complete_daily_bar(
+        context,
+        phase_context,
+    )
+
+
+def _legacy_market_group(stock_code: Any) -> str:
+    code = str(stock_code or "").strip()
+    if not code or code.lower() == "unknown":
+        return "unknown"
+    market = detect_market(code)
+    return market if market in {"cn", "hk", "us"} else "unknown"
+
+
+def _legacy_audit_marker_specs(
+    context: Dict[str, Any],
+    *,
+    code: str,
+    stock_name: str,
+    report_language: str,
+    news_context: Optional[str],
+    analysis_context_pack_summary: Optional[str],
+) -> List[Dict[str, Any]]:
+    markers: List[Dict[str, Any]] = []
+
+    def add(marker_name: str, value: Any) -> None:
+        if value is None:
+            return
+        text = str(value).strip()
+        if not text:
+            return
+        markers.append(
+            {
+                "marker_name": marker_name,
+                "message_role": "user",
+                "text": text,
+            }
+        )
+
+    add("stock_code", code)
+    add("stock_name", stock_name)
+    add("analysis_date", context.get("date"))
+    add("market_phase", "## Market Phase Context" if report_language == "en" else "## 市场阶段上下文")
+    add("daily_market_context", "## Daily Market Context" if report_language == "en" else "## 大盘环境摘要")
+    add("analysis_context_pack", analysis_context_pack_summary)
+    add("quote", "## 📈 技术面数据")
+    add("news_context", "## 📰 舆情情报" if news_context else None)
+    return markers
 
 
 class _LiteLLMStreamError(RuntimeError):
@@ -121,10 +276,21 @@ class _AllModelsFailedError(Exception):
         self.last_usage = last_usage or {}
 
 
-def check_content_integrity(result: "AnalysisResult") -> Tuple[bool, List[str]]:
+from src.utils.data_processing import normalize_report_signal_attribution
+
+
+def check_content_integrity(
+    result: "AnalysisResult",
+    *,
+    require_phase_decision: bool = False,
+) -> Tuple[bool, List[str]]:
     """
     Check mandatory fields for report content integrity.
     Returns (pass, missing_fields). Module-level for use by pipeline (agent weak mode).
+
+    Note:
+    - Required fields: missing → pass=False, added to missing_fields
+    - Optional fields (e.g., signal_attribution): missing → pass=True and are not added to missing_fields
     """
     missing: List[str] = []
 
@@ -172,6 +338,23 @@ def check_content_integrity(result: "AnalysisResult") -> Tuple[bool, List[str]]:
         stop_loss = sp.get("stop_loss")
         if _is_invalid_stop_loss(stop_loss):
             missing.append("dashboard.battle_plan.sniper_points.stop_loss")
+    if require_phase_decision:
+        phase_decision = dash.get("phase_decision")
+        phase_decision = phase_decision if isinstance(phase_decision, dict) else {}
+        if not isinstance(phase_decision.get("phase_context"), dict):
+            missing.append("dashboard.phase_decision.phase_context")
+        if _is_blank_text(phase_decision.get("action_window")):
+            missing.append("dashboard.phase_decision.action_window")
+        if _is_blank_text(phase_decision.get("immediate_action")):
+            missing.append("dashboard.phase_decision.immediate_action")
+        if not isinstance(phase_decision.get("watch_conditions"), list):
+            missing.append("dashboard.phase_decision.watch_conditions")
+        if _is_blank_text(phase_decision.get("next_check_time")):
+            missing.append("dashboard.phase_decision.next_check_time")
+        if _is_blank_text(phase_decision.get("confidence_reason")):
+            missing.append("dashboard.phase_decision.confidence_reason")
+        if not isinstance(phase_decision.get("data_limitations"), list):
+            missing.append("dashboard.phase_decision.data_limitations")
     return len(missing) == 0, missing
 
 
@@ -197,7 +380,30 @@ def apply_placeholder_fill(result: "AnalysisResult", missing_fields: List[str]) 
             return not value.strip()
         return False
 
-    placeholder = get_placeholder_text(getattr(result, "report_language", "zh"))
+    report_language = normalize_report_language(getattr(result, "report_language", "zh"))
+    placeholder = get_placeholder_text(report_language)
+    phase_decision_placeholders = {
+        "dashboard.phase_decision.action_window": (
+            "Model did not provide a phase action window"
+            if report_language == "en"
+            else "模型未提供阶段化行动窗口"
+        ),
+        "dashboard.phase_decision.immediate_action": (
+            "Model did not provide a phase-aware immediate action"
+            if report_language == "en"
+            else "模型未提供阶段化即时动作"
+        ),
+        "dashboard.phase_decision.next_check_time": (
+            "Model did not provide a next check point"
+            if report_language == "en"
+            else "模型未提供下一次检查点"
+        ),
+        "dashboard.phase_decision.confidence_reason": (
+            "Model did not provide a phase confidence rationale"
+            if report_language == "en"
+            else "模型未提供阶段化置信度理由"
+        ),
+    }
     for field in missing_fields:
         if field == "sentiment_score":
             result.sentiment_score = 50
@@ -244,6 +450,25 @@ def apply_placeholder_fill(result: "AnalysisResult", missing_fields: List[str]) 
                 battle_plan["sniper_points"] = sniper_points
             if _is_invalid_stop_loss(sniper_points.get("stop_loss")):
                 sniper_points["stop_loss"] = placeholder
+        elif field.startswith("dashboard.phase_decision."):
+            if not result.dashboard:
+                result.dashboard = {}
+            phase_decision = result.dashboard.get("phase_decision")
+            if not isinstance(phase_decision, dict):
+                phase_decision = {}
+                result.dashboard["phase_decision"] = phase_decision
+            if field == "dashboard.phase_decision.phase_context":
+                if not isinstance(phase_decision.get("phase_context"), dict):
+                    phase_decision["phase_context"] = {}
+            elif field == "dashboard.phase_decision.watch_conditions":
+                if not isinstance(phase_decision.get("watch_conditions"), list):
+                    phase_decision["watch_conditions"] = []
+            elif field == "dashboard.phase_decision.data_limitations":
+                if not isinstance(phase_decision.get("data_limitations"), list):
+                    phase_decision["data_limitations"] = []
+            elif field in phase_decision_placeholders:
+                if _is_blank_text(phase_decision.get(field.rsplit(".", 1)[-1])):
+                    phase_decision[field.rsplit(".", 1)[-1]] = phase_decision_placeholders[field]
 
 
 # ---------- chip_structure fallback (Issue #589) ----------
@@ -1371,6 +1596,8 @@ class AnalysisResult:
     decision_type: str = "hold"  # 决策类型：buy/hold/sell（用于统计）
     confidence_level: str = "中"  # 置信度：高/中/低
     report_language: str = "zh"  # 报告输出语言：zh/en
+    action: Optional[str] = None  # 建议动作 taxonomy：buy/add/hold/reduce/sell/watch/avoid/alert
+    action_label: Optional[str] = None  # 本地化建议动作标签
 
     # ========== 决策仪表盘 (新增) ==========
     dashboard: Optional[Dict[str, Any]] = None  # 完整的决策仪表盘数据
@@ -1434,6 +1661,8 @@ class AnalysisResult:
             'decision_type': self.decision_type,
             'confidence_level': self.confidence_level,
             'report_language': self.report_language,
+            'action': self.action,
+            'action_label': self.action_label,
             'dashboard': self.dashboard,  # 决策仪表盘数据
             'trend_analysis': self.trend_analysis,
             'short_term_outlook': self.short_term_outlook,
@@ -1514,6 +1743,30 @@ class AnalysisResult:
             "low": "⭐",
         }
         return star_map.get(str(self.confidence_level or "").strip().lower(), "⭐⭐")
+
+
+def populate_decision_action_fields(
+    result: AnalysisResult,
+    *,
+    explicit_action: Any = None,
+    report_type: Any = None,
+    use_existing_action: bool = True,
+) -> AnalysisResult:
+    """Populate optional decision action fields without changing legacy advice."""
+
+    action_source = explicit_action
+    if action_source is None and use_existing_action:
+        action_source = getattr(result, "action", None)
+
+    fields = build_action_fields(
+        operation_advice=getattr(result, "operation_advice", None),
+        explicit_action=action_source,
+        report_type=report_type,
+        report_language=getattr(result, "report_language", "zh"),
+    )
+    result.action = fields["action"]
+    result.action_label = fields["action_label"]
+    return result
 
 
 class GeminiAnalyzer:
@@ -1625,6 +1878,25 @@ class GeminiAnalyzer:
                 "✅/⚠️/❌ 检查项5：筹码健康",
                 "✅/⚠️/❌ 检查项6：PE估值合理"
             ]
+        },
+
+        "phase_decision": {
+            "phase_context": {"phase": "premarket/intraday/lunch_break/closing_auction/postmarket/non_trading/unknown"},
+            "action_window": "盘前计划/盘中跟踪/午间确认/收盘前风控/盘后复盘/非交易日观察",
+            "immediate_action": "立即行动/等待确认/观察/止损止盈预警/禁止追高/无盘中动作",
+            "watch_conditions": ["观察条件1", "观察条件2"],
+            "next_check_time": "下一次检查点或市场本地时间",
+            "confidence_reason": "置信度理由，说明阶段和数据质量限制",
+            "data_limitations": ["阶段或数据质量限制1", "阶段或数据质量限制2"]
+        },
+
+        "signal_attribution": {
+            "technical_indicators": 技术指标贡献度(0-100),
+            "news_sentiment": 新闻舆情贡献度(0-100),
+            "fundamentals": 基本面贡献度(0-100),
+            "market_conditions": 市场环境贡献度(0-100),
+            "strongest_bullish_signal": "最强看多信号名称",
+            "strongest_bearish_signal": "最强看空信号名称"
         }
     },
 
@@ -1692,7 +1964,10 @@ class GeminiAnalyzer:
 - 操作建议必须同时参考价格位置（支撑/压力位）、量能/筹码、主力资金流向和风险事件。
 - 股价位于支撑与压力之间、资金流不明确时，优先输出“持有/震荡/观望/洗盘观察”等可执行的中性建议；`decision_type` 仍保持 `hold`。
 - 只有在接近支撑确认或有效突破压力，且资金流/量价配合时，才能给出买入；接近压力且资金流出时不得追买。
-- 只有在跌破关键支撑、主力资金持续流出或风险显著放大时，才能给出卖出/减仓。"""
+- 只有在跌破关键支撑、主力资金持续流出或风险显著放大时，才能给出卖出/减仓。
+- 必须输出 `dashboard.phase_decision` 七字段；盘中/午休/临近收盘要给出当前动作、观察条件和下一次检查点。
+- 建议输出可选展示字段 `dashboard.signal_attribution` 六字段；解释推荐理由的构成，包括技术指标、新闻舆情、基本面、市场环境的贡献度，以及最强看多/看空信号。
+- 盘前、非交易日或未知阶段不得伪造今日盘中走势；quote/daily_bars/technical 存在 stale、fallback、missing、fetch_failed、partial 或 estimated 时，`confidence_level` 不得为高。"""
 
     SYSTEM_PROMPT = """你是一位{market_placeholder}投资分析师，负责生成专业的【决策仪表盘】分析报告。
 
@@ -1783,6 +2058,25 @@ class GeminiAnalyzer:
                 "✅/⚠️/❌ 检查项5：仓位与止损计划明确",
                 "✅/⚠️/❌ 检查项6：估值/业绩/催化与结论匹配"
             ]
+        },
+
+        "phase_decision": {
+            "phase_context": {"phase": "premarket/intraday/lunch_break/closing_auction/postmarket/non_trading/unknown"},
+            "action_window": "盘前计划/盘中跟踪/午间确认/收盘前风控/盘后复盘/非交易日观察",
+            "immediate_action": "立即行动/等待确认/观察/止损止盈预警/禁止追高/无盘中动作",
+            "watch_conditions": ["观察条件1", "观察条件2"],
+            "next_check_time": "下一次检查点或市场本地时间",
+            "confidence_reason": "置信度理由，说明阶段和数据质量限制",
+            "data_limitations": ["阶段或数据质量限制1", "阶段或数据质量限制2"]
+        },
+
+        "signal_attribution": {
+            "technical_indicators": 技术指标贡献度(0-100),
+            "news_sentiment": 新闻舆情贡献度(0-100),
+            "fundamentals": 基本面贡献度(0-100),
+            "market_conditions": 市场环境贡献度(0-100),
+            "strongest_bullish_signal": "最强看多信号名称",
+            "strongest_bearish_signal": "最强看空信号名称"
         }
     },
 
@@ -1847,7 +2141,10 @@ class GeminiAnalyzer:
 - 操作建议必须同时参考价格位置（支撑/压力位）、量能/筹码、主力资金流向和风险事件。
 - 股价位于支撑与压力之间、资金流不明确时，优先输出“持有/震荡/观望/洗盘观察”等可执行的中性建议；`decision_type` 仍保持 `hold`。
 - 只有在接近支撑确认或有效突破压力，且资金流/量价配合时，才能给出买入；接近压力且资金流出时不得追买。
-- 只有在跌破关键支撑、主力资金持续流出或风险显著放大时，才能给出卖出/减仓。"""
+- 只有在跌破关键支撑、主力资金持续流出或风险显著放大时，才能给出卖出/减仓。
+- 必须输出 `dashboard.phase_decision` 七字段；盘中/午休/临近收盘要给出当前动作、观察条件和下一次检查点。
+- 建议输出可选展示字段 `dashboard.signal_attribution` 六字段；解释推荐理由的构成，包括技术指标、新闻舆情、基本面、市场环境的贡献度，以及最强看多/看空信号。
+- 盘前、非交易日或未知阶段不得伪造今日盘中走势；quote/daily_bars/technical 存在 stale、fallback、missing、fetch_failed、partial 或 estimated 时，`confidence_level` 不得为高。"""
 
     TEXT_SYSTEM_PROMPT = """你是一位专业的股票分析助手。
 
@@ -1882,7 +2179,17 @@ class GeminiAnalyzer:
         self._litellm_available = False
         self._init_litellm()
         if not self._litellm_available:
-            logger.warning("No LLM configured (LITELLM_MODEL / API keys), AI analysis will be unavailable")
+            try:
+                backend_id, _fallback_backend_id = self._resolve_generation_backend_config()
+            except GenerationError:
+                backend_id = ""
+            if backend_id == CODEX_CLI_BACKEND_ID:
+                logger.info(
+                    "Analyzer generation backend: codex_cli configured; "
+                    "LiteLLM API keys are not required for stock analysis generation"
+                )
+            else:
+                logger.warning("No LLM configured (LITELLM_MODEL / API keys), AI analysis will be unavailable")
 
     def _get_runtime_config(self) -> Config:
         """Return the runtime config, honoring injected overrides for tests/pipeline."""
@@ -2021,9 +2328,23 @@ class GeminiAnalyzer:
     def _init_litellm(self) -> None:
         """Initialize litellm Router from channels / YAML / legacy keys."""
         config = self._get_runtime_config()
+        if self._get_hermes_config_error(config) is not None:
+            logger.error("Analyzer LLM: Hermes channel configuration blocks legacy fallback")
+            return
         litellm_model = config.litellm_model
         if not litellm_model:
-            logger.warning("Analyzer LLM: LITELLM_MODEL not configured")
+            backend_id = ""
+            try:
+                backend_id = resolve_generation_backend_id(config)
+            except GenerationError:
+                pass
+            if backend_id == CODEX_CLI_BACKEND_ID:
+                logger.info(
+                    "Analyzer LiteLLM: LITELLM_MODEL not configured; "
+                    "using codex_cli generation backend"
+                )
+            else:
+                logger.warning("Analyzer LLM: LITELLM_MODEL not configured")
             return
 
         self._litellm_available = True
@@ -2031,9 +2352,23 @@ class GeminiAnalyzer:
         # --- Channel / YAML path: build Router from pre-built model_list ---
         if self._has_channel_config(config):
             model_list = config.llm_model_list
+            if self._get_mixed_hermes_route_error(config, litellm_model) is not None:
+                self._litellm_available = False
+                logger.error("Analyzer LLM: mixed Hermes/non-Hermes route requires deployment-level no-proxy support")
+                return
+            router_model_list = model_list
+            if route_has_hermes(model_list, litellm_model):
+                # Hermes-only routes are dispatched directly with a request-scoped
+                # no-proxy OpenAI client. Keeping them out of Router prevents the
+                # default proxy-aware transport from seeing the Hermes bearer key.
+                router_model_list = filter_non_hermes_deployments(model_list)
+                if not router_model_list:
+                    self._litellm_available = True
+                    logger.info("Analyzer LLM: Hermes-only route will use direct no-proxy completion")
+                    return
             try:
                 self._router = Router(
-                    model_list=model_list,
+                    model_list=router_model_list,
                     routing_strategy="simple-shuffle",
                     num_retries=2,
                 )
@@ -2046,7 +2381,7 @@ class GeminiAnalyzer:
                 ))
                 logger.info(
                     f"Analyzer LLM: Router initialized from channels/YAML — "
-                    f"{len(model_list)} deployment(s), models: {unique_models}"
+                    f"{len(router_model_list)} deployment(s), models: {unique_models}"
                 )
                 return
 
@@ -2101,8 +2436,164 @@ class GeminiAnalyzer:
             )
 
     def is_available(self) -> bool:
-        """Check if LiteLLM is properly configured with at least one API key."""
+        """Check whether the configured generation backend is available."""
+        backend_error = self.get_generation_backend_config_error()
+        if backend_error is not None:
+            return self._can_use_generation_fallback(backend_error)
+        backend_id, _fallback_backend_id = self._resolve_generation_backend_config()
+        if backend_id == CODEX_CLI_BACKEND_ID:
+            return True
+        return self._litellm_runtime_available()
+
+    def _litellm_runtime_available(self) -> bool:
         return self._router is not None or self._litellm_available
+
+    def _can_use_generation_fallback(self, backend_error: GenerationError) -> bool:
+        if not backend_error.fallbackable:
+            return False
+        try:
+            _backend_id, fallback_backend_id = self._resolve_generation_backend_config()
+        except GenerationError:
+            return False
+        return (
+            fallback_backend_id == LITELLM_BACKEND_ID
+            and self._litellm_runtime_available()
+        )
+
+    def _resolve_generation_backend_config(self) -> Tuple[str, Optional[str]]:
+        """Resolve and validate generation backend ids."""
+        config = self._get_runtime_config()
+        backend_id = resolve_generation_backend_id(config)
+        fallback_backend_id = resolve_generation_fallback_backend_id(config)
+        return backend_id, fallback_backend_id
+
+    def get_generation_backend_config_error(self) -> Optional[GenerationError]:
+        """Return a structured backend config error, if the backend cannot run."""
+        try:
+            backend_id, _fallback_backend_id = self._resolve_generation_backend_config()
+            config = self._get_runtime_config()
+            hermes_error = self._get_hermes_config_error(config)
+            if hermes_error is not None:
+                return hermes_error
+            for model in [getattr(config, "litellm_model", "")] + list(getattr(config, "litellm_fallback_models", []) or []):
+                mixed_error = self._get_mixed_hermes_route_error(config, model)
+                if mixed_error is not None:
+                    return mixed_error
+            if backend_id == CODEX_CLI_BACKEND_ID:
+                backend = self._get_generation_backend(backend_id)
+                get_config_error = getattr(backend, "get_config_error", None)
+                if callable(get_config_error):
+                    return get_config_error()
+        except GenerationError as exc:
+            return exc
+        return None
+
+    def _get_hermes_config_error(self, config: Config) -> Optional[GenerationError]:
+        issues = list(getattr(config, "llm_channel_config_issues", []) or [])
+        if not getattr(config, "llm_blocks_legacy_fallback", False) or not issues:
+            return None
+        blocked_routes = set(getattr(config, "llm_blocked_hermes_routes", []) or [])
+        selected_models = [
+            ("LITELLM_MODEL", getattr(config, "litellm_model", "") or ""),
+            *[
+                ("LITELLM_FALLBACK_MODELS", fallback_model)
+                for fallback_model in list(getattr(config, "litellm_fallback_models", []) or [])
+            ],
+        ]
+        selected_blocked_route = ""
+        selected_field = ""
+        for field_name, model in selected_models:
+            raw_model = str(model or "").strip()
+            if not raw_model:
+                continue
+            candidates = hermes_blocked_route_candidates(raw_model)
+            candidates.add(raw_model)
+            try:
+                candidates.add(canonicalize_hermes_model_ref(raw_model).route_model)
+            except (TypeError, ValueError) as exc:
+                logger.debug("Failed to canonicalize selected Hermes route candidate %r: %s", raw_model, exc)
+            matched = candidates & blocked_routes
+            if matched:
+                selected_blocked_route = sorted(matched)[0]
+                selected_field = field_name
+                break
+        if blocked_routes and not selected_blocked_route and getattr(config, "llm_model_list", None):
+            return None
+        first = issues[0]
+        code = (
+            "explicit_hermes_route_invalid"
+            if selected_blocked_route
+            else first.get("code", "invalid_hermes_channel")
+        )
+        return GenerationError(
+            error_code=GenerationErrorCode.UNSAFE_CONFIG,
+            stage="configuration",
+            retryable=False,
+            fallbackable=False,
+            backend=LITELLM_BACKEND_ID,
+            provider=HERMES_CHANNEL_NAME,
+            details={
+                "field": selected_field or first.get("field", "LLM_HERMES_API_KEY"),
+                "code": code,
+                "reason": code,
+                "message": first.get("message", "Hermes channel configuration is invalid"),
+                "issues": issues,
+                "route_name": selected_blocked_route or None,
+            },
+        )
+
+    def _get_mixed_hermes_route_error(self, config: Config, model: str) -> Optional[GenerationError]:
+        if not model:
+            return None
+        origins = route_deployment_origins(getattr(config, "llm_model_list", []) or [], model)
+        if not origins.is_mixed:
+            return None
+        return GenerationError(
+            error_code=GenerationErrorCode.UNSAFE_CONFIG,
+            stage="configuration",
+            retryable=False,
+            fallbackable=False,
+            backend=LITELLM_BACKEND_ID,
+            provider=HERMES_CHANNEL_NAME,
+            details={
+                "field": "LLM_CHANNELS",
+                "code": "mixed_hermes_route_unsupported",
+                "reason": "router_deployment_no_proxy_unavailable",
+                "route_name": model,
+            },
+        )
+
+    def _hermes_redaction_values_for_model(self, config: Config, model: str = "") -> set[str]:
+        redactions: set[str] = set()
+        deployments = list(getattr(config, "llm_model_list", []) or [])
+        selected_deployments = deployments
+        if model:
+            origins = route_deployment_origins(deployments, model)
+            selected_deployments = list(origins.hermes_deployments or [])
+            if not selected_deployments and not origins.has_hermes:
+                return redactions
+        for deployment in selected_deployments:
+            if not isinstance(deployment, dict):
+                continue
+            if not route_has_hermes([deployment], str(deployment.get("model_name") or "")):
+                continue
+            params = deployment.get("litellm_params") or {}
+            if isinstance(params, dict):
+                redactions.update(build_hermes_redaction_values(params.get("api_key")))
+        return redactions
+
+    def _sanitize_hermes_exception_text(
+        self,
+        exc: Any,
+        *,
+        config: Optional[Config] = None,
+        model: str = "",
+    ) -> str:
+        runtime_config = config or self._get_runtime_config()
+        redactions = self._hermes_redaction_values_for_model(runtime_config, model)
+        if not redactions:
+            return str(exc)
+        return sanitize_hermes_error_text(exc, redaction_values=redactions)
 
     def _dispatch_litellm_completion(
         self,
@@ -2114,6 +2605,26 @@ class GeminiAnalyzer:
         router_model_names: set[str],
     ) -> Any:
         """Dispatch a LiteLLM completion through router or direct fallback."""
+        origins = route_deployment_origins(config.llm_model_list, model)
+        if origins.is_mixed:
+            raise RuntimeError("Hermes/non-Hermes mixed generation route is not supported without deployment-level no-proxy client support")
+        if origins.is_hermes_only:
+            deployment = origins.hermes_deployments[0]
+            params = dict(deployment.get("litellm_params") or {})
+            api_key = str(params.get("api_key") or "").strip()
+            base_url = str(params.get("api_base") or "").strip()
+            if is_masked_secret_placeholder(api_key):
+                raise RuntimeError("Hermes API key is a masked placeholder and cannot be used for generation")
+            timeout = float(call_kwargs.get("timeout") or 30.0)
+            hermes_kwargs = dict(call_kwargs)
+            hermes_kwargs["model"] = str(params.get("model") or model)
+            hermes_kwargs["stream"] = False
+            hermes_kwargs.pop("api_key", None)
+            hermes_kwargs.pop("api_base", None)
+            with open_hermes_no_proxy_client(api_key=api_key, base_url=base_url, timeout=timeout) as client:
+                hermes_kwargs["client"] = client
+                return litellm.completion(**hermes_kwargs)
+
         wire_models = resolve_fallback_litellm_wire_models(model, config.llm_model_list)
         register_fallback_model_pricing(wire_models)
         effective_kwargs = dict(call_kwargs)
@@ -2128,21 +2639,22 @@ class GeminiAnalyzer:
         effective_kwargs.update(extra_litellm_params(model, config))
         return litellm.completion(**effective_kwargs)
 
-    def _normalize_usage(self, usage_obj: Any) -> Dict[str, Any]:
+    def _normalize_usage(
+        self,
+        usage_obj: Any,
+        *,
+        model: str = "",
+        provider: Optional[str] = None,
+        messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
         """Normalize usage objects from LiteLLM responses/chunks."""
         if not usage_obj:
-            return {}
-
-        def _get_value(key: str) -> int:
-            if isinstance(usage_obj, dict):
-                return int(usage_obj.get(key) or 0)
-            return int(getattr(usage_obj, key, 0) or 0)
-
-        return {
-            "prompt_tokens": _get_value("prompt_tokens"),
-            "completion_tokens": _get_value("completion_tokens"),
-            "total_tokens": _get_value("total_tokens"),
-        }
+            usage = attach_message_hmacs({}, messages) if messages is not None else {}
+            return filter_prompt_cache_telemetry(usage, self._get_runtime_config())
+        usage = normalize_litellm_usage(usage_obj, model=model, provider=provider)
+        if messages is not None:
+            usage = attach_message_hmacs(usage, messages)
+        return filter_prompt_cache_telemetry(usage, self._get_runtime_config())
 
     @staticmethod
     def _get_response_field(obj: Any, key: str) -> Any:
@@ -2247,6 +2759,8 @@ class GeminiAnalyzer:
         stream_response: Any,
         *,
         model: str,
+        usage_model: Optional[str] = None,
+        provider: Optional[str] = None,
         progress_callback: Optional[Callable[[int], None]] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """Consume a LiteLLM stream into a single text payload."""
@@ -2257,8 +2771,12 @@ class GeminiAnalyzer:
 
         try:
             for chunk in stream_response:
-                chunk_usage = chunk.get("usage") if isinstance(chunk, dict) else getattr(chunk, "usage", None)
-                normalized_usage = self._normalize_usage(chunk_usage)
+                chunk_usage = extract_usage_payload(chunk)
+                normalized_usage = self._normalize_usage(
+                    chunk_usage,
+                    model=usage_model or model,
+                    provider=provider,
+                )
                 if normalized_usage:
                     usage = normalized_usage
 
@@ -2289,6 +2807,16 @@ class GeminiAnalyzer:
 
         return response_text, usage
 
+    def _get_generation_backend(self, backend_id: Optional[str] = None) -> GenerationBackend:
+        """Return the configured generation backend."""
+        config = self._get_runtime_config()
+        resolved_backend_id = backend_id or self._resolve_generation_backend_config()[0]
+        return create_generation_backend(
+            resolved_backend_id,
+            config=config,
+            litellm_completion_callable=self._call_litellm_impl,
+        )
+
     def _call_litellm(
         self,
         prompt: str,
@@ -2298,6 +2826,117 @@ class GeminiAnalyzer:
         stream: bool = False,
         stream_progress_callback: Optional[Callable[[int], None]] = None,
         response_validator: Optional[Callable[[str], None]] = None,
+        audit_context: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[str, str, Dict[str, Any]]:
+        """Compatibility wrapper around the configured generation backend."""
+        preflight_error = self.get_generation_backend_config_error()
+        if preflight_error is not None and not self._can_use_generation_fallback(preflight_error):
+            raise preflight_error
+        backend_id, fallback_backend_id = self._resolve_generation_backend_config()
+        try:
+            result = self._get_generation_backend(backend_id).generate(
+                prompt,
+                generation_config,
+                system_prompt=system_prompt,
+                stream=stream,
+                stream_progress_callback=stream_progress_callback,
+                response_validator=response_validator,
+                audit_context=audit_context,
+            )
+        except GenerationError as exc:
+            if not exc.fallbackable or not fallback_backend_id:
+                raise
+            try:
+                fallback_backend = self._get_generation_backend(fallback_backend_id)
+            except GenerationError as fallback_exc:
+                raise GenerationError(
+                    error_code=fallback_exc.error_code,
+                    stage="fallback",
+                    retryable=False,
+                    fallbackable=False,
+                    backend=fallback_backend_id,
+                    provider=fallback_exc.provider,
+                    details={
+                        "primary_error": {
+                            "error_code": exc.error_code.value,
+                            "backend": exc.backend,
+                            "provider": exc.provider,
+                            "stage": exc.stage,
+                            "details": exc.details,
+                        },
+                        "fallback_error": fallback_exc.details,
+                    },
+                ) from fallback_exc
+            try:
+                result = fallback_backend.generate(
+                    prompt,
+                    generation_config,
+                    system_prompt=system_prompt,
+                    stream=stream,
+                    stream_progress_callback=stream_progress_callback,
+                    response_validator=response_validator,
+                    audit_context=audit_context,
+                )
+            except _AllModelsFailedError:
+                raise
+            except GenerationError as fallback_exc:
+                raise GenerationError(
+                    error_code=fallback_exc.error_code,
+                    stage="fallback",
+                    retryable=False,
+                    fallbackable=False,
+                    backend=fallback_backend_id,
+                    provider=fallback_exc.provider,
+                    details={
+                        "reason": "fallback_backend_failed",
+                        "primary_error": {
+                            "error_code": exc.error_code.value,
+                            "backend": exc.backend,
+                            "provider": exc.provider,
+                            "stage": exc.stage,
+                            "details": exc.details,
+                        },
+                        "fallback_error": {
+                            "error_code": fallback_exc.error_code.value,
+                            "backend": fallback_exc.backend,
+                            "provider": fallback_exc.provider,
+                            "stage": fallback_exc.stage,
+                            "details": fallback_exc.details,
+                        },
+                    },
+                ) from fallback_exc
+            except Exception as fallback_exc:
+                raise GenerationError(
+                    error_code=GenerationErrorCode.UNKNOWN_BACKEND_ERROR,
+                    stage="fallback",
+                    retryable=False,
+                    fallbackable=False,
+                    backend=fallback_backend_id,
+                    provider=fallback_backend_id,
+                    details={
+                        "reason": "fallback_backend_failed",
+                        "primary_error": {
+                            "error_code": exc.error_code.value,
+                            "backend": exc.backend,
+                            "provider": exc.provider,
+                            "stage": exc.stage,
+                            "details": exc.details,
+                        },
+                        "fallback_error": str(fallback_exc),
+                    },
+                ) from fallback_exc
+        return result.text, result.model, result.usage
+
+    def _call_litellm_impl(
+        self,
+        prompt: str,
+        generation_config: dict,
+        *,
+        system_prompt: Optional[str] = None,
+        stream: bool = False,
+        stream_progress_callback: Optional[Callable[[int], None]] = None,
+        response_validator: Optional[Callable[[str], None]] = None,
+        audit_context: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, str, Dict[str, Any]]:
         """Call LLM via litellm with fallback across configured models.
 
@@ -2339,12 +2978,38 @@ class GeminiAnalyzer:
         effective_system_prompt = system_prompt or self.TEXT_SYSTEM_PROMPT
         router_model_names = set(get_configured_llm_models(config.llm_model_list))
         for model in models_to_try:
+            origins = route_deployment_origins(config.llm_model_list, model)
+            model_stream = bool(stream and not origins.has_hermes)
             recovery_model_list = config.llm_model_list
             legacy_router_model_list = getattr(self, "_legacy_router_model_list", None) or []
             if legacy_router_model_list and model == config.litellm_model and not use_channel_router:
                 recovery_model_list = legacy_router_model_list
+            usage_model, usage_provider = resolved_model_provider_identity(model, recovery_model_list)
 
             try:
+                def _attach_usage_audit(
+                    usage: Dict[str, Any],
+                    messages: List[Dict[str, Any]],
+                ) -> Dict[str, Any]:
+                    if audit_context is None:
+                        return filter_prompt_cache_telemetry(
+                            attach_message_hmacs(usage, messages),
+                            config,
+                        )
+                    effective_audit_context = dict(audit_context)
+                    effective_audit_context["provider"] = usage_provider
+                    effective_audit_context["transport"] = (
+                        effective_audit_context.get("transport") or "litellm"
+                    )
+                    return filter_prompt_cache_telemetry(
+                        attach_legacy_message_stability_audit(
+                            usage,
+                            messages,
+                            effective_audit_context,
+                        ),
+                        config,
+                    )
+
                 model_short = model.split("/")[-1] if "/" in model else model
                 extra = get_thinking_extra_body(model_short)
                 call_kwargs: Dict[str, Any] = {
@@ -2378,11 +3043,22 @@ class GeminiAnalyzer:
                     requested_temperature,
                     model_list=recovery_model_list,
                 )
+                route_context = build_provider_cache_route_context(
+                    model=model,
+                    provider=usage_provider,
+                    call_kwargs=call_kwargs,
+                    model_list=recovery_model_list,
+                    call_type="analysis",
+                )
+                hint_result = apply_prompt_cache_hints(call_kwargs, route_context, config)
+                call_kwargs = hint_result.call_kwargs
+                if hint_result.diagnostics:
+                    logger.debug("[PromptCache] %s", hint_result.diagnostics)
 
                 _stream_text: Optional[str] = None
                 _stream_usage: Dict[str, Any] = {}
 
-                if stream:
+                if model_stream:
                     try:
                         stream_response = call_litellm_with_param_recovery(
                             lambda kwargs: self._dispatch_litellm_completion(
@@ -2401,6 +3077,8 @@ class GeminiAnalyzer:
                         _stream_text, _stream_usage = self._consume_litellm_stream(
                             stream_response,
                             model=model,
+                            usage_model=usage_model,
+                            provider=usage_provider,
                             progress_callback=stream_progress_callback,
                         )
                     except _LiteLLMStreamError as exc:
@@ -2427,6 +3105,7 @@ class GeminiAnalyzer:
                 if _stream_text is not None:
                     last_response_text = _stream_text
                     last_model = model
+                    _stream_usage = _attach_usage_audit(_stream_usage, call_kwargs["messages"])
                     last_usage = _stream_usage
                     if response_validator is not None:
                         response_validator(_stream_text)
@@ -2448,7 +3127,15 @@ class GeminiAnalyzer:
 
                 content = self._extract_completion_text(response)
                 if content:
-                    usage = self._normalize_usage(self._get_response_field(response, "usage"))
+                    usage_messages = None if audit_context is not None else call_kwargs["messages"]
+                    usage = self._normalize_usage(
+                        extract_usage_payload(response),
+                        model=usage_model or model,
+                        provider=usage_provider,
+                        messages=usage_messages,
+                    )
+                    if audit_context is not None:
+                        usage = _attach_usage_audit(usage, call_kwargs["messages"])
                     last_response_text = content
                     last_model = model
                     last_usage = usage
@@ -2458,8 +3145,9 @@ class GeminiAnalyzer:
                 raise ValueError("LLM returned empty response")
 
             except Exception as e:
-                logger.warning(f"[LiteLLM] {model} failed: {e}")
-                last_error = e
+                safe_error = self._sanitize_hermes_exception_text(e, config=config, model=model)
+                logger.warning("[LiteLLM] %s failed: %s", model, safe_error)
+                last_error = RuntimeError(safe_error) if safe_error != str(e) else e
                 continue
 
         raise _AllModelsFailedError(
@@ -2496,9 +3184,12 @@ class GeminiAnalyzer:
             )
             if isinstance(result, tuple):
                 text, model_used, usage = result
-                persist_llm_usage(usage, model_used, call_type="market_review")
+                if should_persist_usage_telemetry(usage):
+                    persist_llm_usage(usage, model_used, call_type="market_review")
                 return text
             return result
+        except GenerationError:
+            raise
         except Exception as exc:
             logger.error("[generate_text] LLM call failed: %s", exc)
             return None
@@ -2509,6 +3200,7 @@ class GeminiAnalyzer:
         news_context: Optional[str] = None,
         progress_callback: Optional[Callable[[int, str], None]] = None,
         stream_progress_callback: Optional[Callable[[int], None]] = None,
+        analysis_context_pack_summary: Optional[str] = None,
     ) -> AnalysisResult:
         """
         分析单只股票
@@ -2522,7 +3214,7 @@ class GeminiAnalyzer:
         Args:
             context: 从 storage.get_analysis_context() 获取的上下文数据
             news_context: 预先搜索的新闻内容（可选）
-            
+
         Returns:
             AnalysisResult 对象
         """
@@ -2538,6 +3230,7 @@ class GeminiAnalyzer:
         config = self._get_runtime_config()
         report_language = normalize_report_language(getattr(config, "report_language", "zh"))
         system_prompt = self._get_analysis_system_prompt(report_language, stock_code=code)
+        skill_instructions, default_skill_policy, use_legacy_default_prompt = self._get_skill_prompt_sections()
         
         # 请求前增加延时（防止连续请求触发限流）
         request_delay = config.gemini_request_delay
@@ -2555,7 +3248,48 @@ class GeminiAnalyzer:
             else:
                 # 最后从映射表获取
                 name = STOCK_NAME_MAP.get(code, f'股票{code}')
-        
+
+        backend_error = self.get_generation_backend_config_error()
+        if backend_error is not None and not self._can_use_generation_fallback(backend_error):
+            details = backend_error.details or {}
+            field = str(details.get("field") or "GENERATION_BACKEND")
+            requested_backend = str(details.get("requested_backend") or backend_error.backend)
+            reason = str(details.get("reason") or backend_error.error_code.value)
+            if report_language == "en":
+                summary = (
+                    "AI analysis is unavailable because the generation backend "
+                    f"cannot start: {backend_error.error_code.value}."
+                )
+                risk_warning = (
+                    f"Check {field}={requested_backend} ({reason}) or set a valid "
+                    "backend/fallback before retrying."
+                )
+            else:
+                summary = (
+                    "AI 分析功能不可用：生成后端无法启动，"
+                    f"{backend_error.error_code.value}。"
+                )
+                risk_warning = (
+                    f"请检查 {field}={requested_backend}（{reason}），"
+                    "或配置有效后端/回退后重试。"
+                )
+            return AnalysisResult(
+                code=code,
+                name=name,
+                sentiment_score=50,
+                trend_prediction='Sideways' if report_language == "en" else '震荡',
+                operation_advice='Hold' if report_language == "en" else '持有',
+                confidence_level='Low' if report_language == "en" else '低',
+                analysis_summary=summary,
+                risk_warning=risk_warning,
+                success=False,
+                error_message=(
+                    f"{backend_error.error_code.value}: {field}={requested_backend}"
+                ),
+                model_used=None,
+                report_language=report_language,
+            )
+
         # 如果模型不可用，返回默认结果
         if not self.is_available():
             return AnalysisResult(
@@ -2575,19 +3309,53 @@ class GeminiAnalyzer:
         
         try:
             # 格式化输入（包含技术面数据和新闻）
-            prompt = self._format_prompt(context, name, news_context, report_language=report_language)
+            prompt = self._format_prompt(
+                context,
+                name,
+                news_context,
+                report_language=report_language,
+                analysis_context_pack_summary=analysis_context_pack_summary,
+            )
+            legacy_audit_context = {
+                "language": report_language,
+                "market_group": _legacy_market_group(code),
+                "analysis_mode": "stock_analysis",
+                "legacy_prompt_mode": "legacy_default" if use_legacy_default_prompt else "skill_aware",
+                "skill_config": {
+                    "skill_instructions": skill_instructions,
+                    "default_skill_policy": default_skill_policy,
+                    "use_legacy_default_prompt": use_legacy_default_prompt,
+                },
+                "transport": "litellm",
+                "dynamic_markers": _legacy_audit_marker_specs(
+                    context,
+                    code=code,
+                    stock_name=name,
+                    report_language=report_language,
+                    news_context=news_context,
+                    analysis_context_pack_summary=analysis_context_pack_summary,
+                ),
+            }
             
             config = self._get_runtime_config()
+            backend_id, _fallback_backend_id = self._resolve_generation_backend_config()
             model_name = config.litellm_model or "unknown"
+            if backend_id == CODEX_CLI_BACKEND_ID:
+                model_name = CODEX_CLI_BACKEND_ID
+                legacy_audit_context["transport"] = CODEX_CLI_BACKEND_ID
             logger.info(f"========== AI 分析 {name}({code}) ==========")
             logger.info(f"[LLM配置] 模型: {model_name}")
             logger.info(f"[LLM配置] Prompt 长度: {len(prompt)} 字符")
             logger.info(f"[LLM配置] 是否包含新闻: {'是' if news_context else '否'}")
 
-            # 记录完整 prompt 到日志（INFO级别记录摘要，DEBUG记录完整）
-            prompt_preview = prompt[:500] + "..." if len(prompt) > 500 else prompt
+            # 本地 CLI backend 是进程执行能力，不记录完整 prompt。
+            if backend_id == CODEX_CLI_BACKEND_ID:
+                prompt_preview = redact_diagnostic_text(prompt, limit=500)
+            else:
+                prompt_preview = prompt[:500] + "..." if len(prompt) > 500 else prompt
             logger.info(f"[LLM Prompt 预览]\n{prompt_preview}")
-            logger.debug(f"=== 完整 Prompt ({len(prompt)}字符) ===\n{prompt}\n=== End Prompt ===")
+            if backend_id != CODEX_CLI_BACKEND_ID:
+                logger.debug(f"=== 完整 Prompt ({len(prompt)}字符) ===\n{prompt}\n=== End Prompt ===")
 
             # 设置生成配置
             generation_config = {
@@ -2613,6 +3381,7 @@ class GeminiAnalyzer:
                         stream=True,
                         stream_progress_callback=stream_progress_callback,
                         response_validator=self._validate_json_response,
+                        audit_context=legacy_audit_context,
                     )
                 except _AllModelsFailedError as exc:
                     if exc.last_response_text is not None:
@@ -2632,11 +3401,15 @@ class GeminiAnalyzer:
                 logger.info(
                     f"[LLM返回] {model_name} 响应成功, 耗时 {elapsed:.2f}s, 响应长度 {len(response_text)} 字符"
                 )
-                response_preview = response_text[:300] + "..." if len(response_text) > 300 else response_text
+                if backend_id == CODEX_CLI_BACKEND_ID:
+                    response_preview = redact_diagnostic_text(response_text, limit=300)
+                else:
+                    response_preview = response_text[:300] + "..." if len(response_text) > 300 else response_text
                 logger.info(f"[LLM返回 预览]\n{response_preview}")
-                logger.debug(
-                    f"=== {model_name} 完整响应 ({len(response_text)}字符) ===\n{response_text}\n=== End Response ==="
-                )
+                if backend_id != CODEX_CLI_BACKEND_ID:
+                    logger.debug(
+                        f"=== {model_name} 完整响应 ({len(response_text)}字符) ===\n{response_text}\n=== End Response ==="
+                    )
                 # Keep parser/retry progress monotonic so task progress/message never "goes backward".
                 parse_progress = min(99, 93 + retry_count * 2)
                 _emit_progress(parse_progress, f"{name}：LLM 返回完成，正在解析 JSON")
@@ -2653,7 +3426,11 @@ class GeminiAnalyzer:
                 # 内容完整性校验（可选）
                 if not config.report_integrity_enabled:
                     break
-                pass_integrity, missing_fields = self._check_content_integrity(result)
+                require_phase_decision = isinstance(context.get("market_phase_context"), dict)
+                pass_integrity, missing_fields = self._check_content_integrity(
+                    result,
+                    require_phase_decision=require_phase_decision,
+                )
                 if pass_integrity:
                     break
                 if retry_count < max_retries:
@@ -2682,14 +3459,16 @@ class GeminiAnalyzer:
                     )
                     break
 
-            persist_llm_usage(llm_usage, model_used, call_type="analysis", stock_code=code)
+            if should_persist_usage_telemetry(llm_usage):
+                persist_llm_usage(llm_usage, model_used, call_type="analysis", stock_code=code)
 
             logger.info(f"[LLM解析] {name}({code}) 分析完成: {result.trend_prediction}, 评分 {result.sentiment_score}")
 
             return result
             
         except Exception as e:
-            logger.error(f"AI 分析 {name}({code}) 失败: {e}")
+            safe_error = self._sanitize_hermes_exception_text(e)
+            logger.error("AI 分析 %s(%s) 失败: %s", name, code, safe_error)
             return AnalysisResult(
                 code=code,
                 name=name,
@@ -2697,10 +3476,10 @@ class GeminiAnalyzer:
                 trend_prediction='Sideways' if report_language == "en" else '震荡',
                 operation_advice='Hold' if report_language == "en" else '持有',
                 confidence_level='Low' if report_language == "en" else '低',
-                analysis_summary=(f'Analysis failed: {str(e)[:100]}' if report_language == "en" else f'分析过程出错: {str(e)[:100]}'),
+                analysis_summary=(f'Analysis failed: {safe_error[:100]}' if report_language == "en" else f'分析过程出错: {safe_error[:100]}'),
                 risk_warning='Analysis failed. Please retry later or review manually.' if report_language == "en" else '分析失败，请稍后重试或手动分析',
                 success=False,
-                error_message=str(e),
+                error_message=safe_error,
                 model_used=None,
                 report_language=report_language,
             )
@@ -2711,6 +3490,7 @@ class GeminiAnalyzer:
         name: str,
         news_context: Optional[str] = None,
         report_language: str = "zh",
+        analysis_context_pack_summary: Optional[str] = None,
     ) -> str:
         """
         格式化分析提示词（决策仪表盘 v2.0）
@@ -2734,6 +3514,31 @@ class GeminiAnalyzer:
         today = context.get('today', {})
         unknown_text = get_unknown_text(report_language)
         no_data_text = get_no_data_text(report_language)
+        quote_section_title, close_price_label = _phase_aware_quote_labels(context)
+        hide_regular_session_ohlc = _should_hide_regular_session_ohlc(context)
+        realtime_overlay_quote = hide_regular_session_ohlc and _today_has_realtime_overlay(today)
+        pct_chg_label = "实时涨跌幅" if realtime_overlay_quote else "涨跌幅"
+        volume_label = "实时成交量" if realtime_overlay_quote else "成交量"
+        amount_label = "实时成交额" if realtime_overlay_quote else "成交额"
+        quote_rows = [
+            f"| {close_price_label} | {today.get('close', 'N/A')} 元 |",
+        ]
+        if not hide_regular_session_ohlc:
+            quote_rows.extend(
+                [
+                    f"| 开盘价 | {today.get('open', 'N/A')} 元 |",
+                    f"| 最高价 | {today.get('high', 'N/A')} 元 |",
+                    f"| 最低价 | {today.get('low', 'N/A')} 元 |",
+                ]
+            )
+        quote_rows.extend(
+            [
+                f"| {pct_chg_label} | {today.get('pct_chg', 'N/A')}% |",
+                f"| {volume_label} | {self._format_volume(today.get('volume'))} |",
+                f"| {amount_label} | {self._format_amount(today.get('amount'))} |",
+            ]
+        )
+        quote_rows_text = "\n".join(quote_rows)
         
         # ========== 构建决策仪表盘格式的输入 ==========
         prompt = f"""# 决策仪表盘分析请求
@@ -2746,19 +3551,27 @@ class GeminiAnalyzer:
 | 分析日期 | {context.get('date', unknown_text)} |
 
 ---
+"""
+        prompt += format_market_phase_prompt_section(
+            context.get("market_phase_context"),
+            report_language=report_language,
+        )
+        daily_market_context_section = format_daily_market_context_prompt_section(
+            context.get("daily_market_context"),
+            report_language=report_language,
+        )
+        if daily_market_context_section:
+            prompt += daily_market_context_section
+        if isinstance(analysis_context_pack_summary, str) and analysis_context_pack_summary:
+            prompt += analysis_context_pack_summary
+        prompt += f"""
 
 ## 📈 技术面数据
 
-### 今日行情
+### {quote_section_title}
 | 指标 | 数值 |
 |------|------|
-| 收盘价 | {today.get('close', 'N/A')} 元 |
-| 开盘价 | {today.get('open', 'N/A')} 元 |
-| 最高价 | {today.get('high', 'N/A')} 元 |
-| 最低价 | {today.get('low', 'N/A')} 元 |
-| 涨跌幅 | {today.get('pct_chg', 'N/A')}% |
-| 成交量 | {self._format_volume(today.get('volume'))} |
-| 成交额 | {self._format_amount(today.get('amount'))} |
+{quote_rows_text}
 
 ### 均线系统（关键判断指标）
 | 均线 | 数值 | 说明 |
@@ -3211,9 +4024,14 @@ class GeminiAnalyzer:
 
         return snapshot
 
-    def _check_content_integrity(self, result: AnalysisResult) -> Tuple[bool, List[str]]:
+    def _check_content_integrity(
+        self,
+        result: AnalysisResult,
+        *,
+        require_phase_decision: bool = False,
+    ) -> Tuple[bool, List[str]]:
         """Delegate to module-level check_content_integrity."""
-        return check_content_integrity(result)
+        return check_content_integrity(result, require_phase_decision=require_phase_decision)
 
     def _build_integrity_complement_prompt(self, missing_fields: List[str], report_language: str = "zh") -> str:
         """Build complement instruction for missing mandatory fields."""
@@ -3233,6 +4051,20 @@ class GeminiAnalyzer:
                     lines.append("- dashboard.intelligence.risk_alerts: risk alert list (can be empty)")
                 elif f == "dashboard.battle_plan.sniper_points.stop_loss":
                     lines.append("- dashboard.battle_plan.sniper_points.stop_loss: stop-loss level")
+                elif f == "dashboard.phase_decision.phase_context":
+                    lines.append("- dashboard.phase_decision.phase_context: public market phase summary subset")
+                elif f == "dashboard.phase_decision.action_window":
+                    lines.append("- dashboard.phase_decision.action_window: phase-aware action window")
+                elif f == "dashboard.phase_decision.immediate_action":
+                    lines.append("- dashboard.phase_decision.immediate_action: act now / wait / watch / no intraday action")
+                elif f == "dashboard.phase_decision.watch_conditions":
+                    lines.append("- dashboard.phase_decision.watch_conditions: list of watch conditions")
+                elif f == "dashboard.phase_decision.next_check_time":
+                    lines.append("- dashboard.phase_decision.next_check_time: next check point or market-local time")
+                elif f == "dashboard.phase_decision.confidence_reason":
+                    lines.append("- dashboard.phase_decision.confidence_reason: confidence rationale and data limits")
+                elif f == "dashboard.phase_decision.data_limitations":
+                    lines.append("- dashboard.phase_decision.data_limitations: list of phase/data quality limitations")
             return "\n".join(lines)
 
         lines = ["### 补全要求：请在上方分析基础上补充以下必填内容，并输出完整 JSON："]
@@ -3249,6 +4081,20 @@ class GeminiAnalyzer:
                 lines.append("- dashboard.intelligence.risk_alerts: 风险警报列表（可为空数组）")
             elif f == "dashboard.battle_plan.sniper_points.stop_loss":
                 lines.append("- dashboard.battle_plan.sniper_points.stop_loss: 止损价")
+            elif f == "dashboard.phase_decision.phase_context":
+                lines.append("- dashboard.phase_decision.phase_context: 公开低敏市场阶段摘要子集")
+            elif f == "dashboard.phase_decision.action_window":
+                lines.append("- dashboard.phase_decision.action_window: 阶段化行动窗口")
+            elif f == "dashboard.phase_decision.immediate_action":
+                lines.append("- dashboard.phase_decision.immediate_action: 立即行动/等待确认/观察/无盘中动作")
+            elif f == "dashboard.phase_decision.watch_conditions":
+                lines.append("- dashboard.phase_decision.watch_conditions: 观察条件数组")
+            elif f == "dashboard.phase_decision.next_check_time":
+                lines.append("- dashboard.phase_decision.next_check_time: 下一次检查点或市场本地时间")
+            elif f == "dashboard.phase_decision.confidence_reason":
+                lines.append("- dashboard.phase_decision.confidence_reason: 置信度理由与数据限制")
+            elif f == "dashboard.phase_decision.data_limitations":
+                lines.append("- dashboard.phase_decision.data_limitations: 阶段/数据质量限制数组")
         return "\n".join(lines)
 
     def _build_integrity_retry_prompt(
@@ -3276,6 +4122,137 @@ class GeminiAnalyzer:
         """Delegate to module-level apply_placeholder_fill."""
         apply_placeholder_fill(result, missing_fields)
 
+    def _extract_analysis_json_object(self, response_text: str) -> Tuple[str, Dict[str, Any]]:
+        """Extract the single allowed JSON object from an LLM response."""
+
+        text = response_text or ""
+        stripped = text.strip()
+        if not stripped:
+            raise ValueError("empty_response")
+
+        fence_pattern = re.compile(
+            r"```[ \t]*(?P<lang>[A-Za-z0-9_-]*)[ \t]*\n?(?P<body>.*?)```",
+            flags=re.DOTALL,
+        )
+        fenced_matches = list(fence_pattern.finditer(text))
+        if len(fenced_matches) > 1:
+            raise ValueError("ambiguous_json")
+        if len(fenced_matches) == 1:
+            match = fenced_matches[0]
+            outside = (text[:match.start()] + text[match.end():]).strip()
+            if outside:
+                raise ValueError("ambiguous_json")
+            fence_lang = (match.group("lang") or "").strip().lower()
+            if fence_lang not in {"", "json"}:
+                raise ValueError("ambiguous_json")
+            json_str = match.group("body").strip()
+            data = self._load_analysis_json_candidate(json_str)
+            return json_str, data
+        if "```" in text:
+            raise ValueError("ambiguous_json")
+
+        try:
+            data = self._load_analysis_json_candidate(stripped)
+        except json.JSONDecodeError as exc:
+            if self._contains_embedded_json_object(text):
+                raise ValueError("ambiguous_json") from exc
+            raise
+        return stripped, data
+
+    def _load_analysis_json_candidate(self, json_str: str) -> Dict[str, Any]:
+        """Parse one already-selected JSON candidate, repairing common LLM JSON drift."""
+        try:
+            data = json.loads(json_str)
+        except json.JSONDecodeError:
+            stripped = (json_str or "").strip()
+            try:
+                _obj, end = json.JSONDecoder().raw_decode(stripped)
+            except json.JSONDecodeError:
+                pass
+            else:
+                if stripped[end:].strip():
+                    raise
+            if not (stripped.startswith("{") and stripped.endswith("}")):
+                raise
+            repaired = self._fix_json_string(stripped)
+            data = json.loads(repaired)
+        if not isinstance(data, dict):
+            raise TypeError("json_root_not_object")
+        return data
+
+    @staticmethod
+    def _contains_embedded_json_object(text: str) -> bool:
+        decoder = json.JSONDecoder()
+        count = 0
+        for index, char in enumerate(text):
+            if char != "{":
+                continue
+            try:
+                _obj, end = decoder.raw_decode(text[index:])
+            except json.JSONDecodeError:
+                continue
+            count += 1
+            before = text[:index].strip()
+            after = text[index + end:].strip()
+            if count > 1 or before or after:
+                return True
+        return False
+
+    def _validate_analysis_minimal_contract(self, data: Dict[str, Any]) -> None:
+        try:
+            AnalysisReportSchema.model_validate(data)
+        except Exception as exc:
+            logger.warning(
+                "AnalysisReportSchema validation failed; continuing with raw parser contract: %s",
+                str(exc)[:200],
+            )
+        minimal_keys = {
+            "sentiment_score",
+            "trend_prediction",
+            "operation_advice",
+            "analysis_summary",
+            "dashboard",
+        }
+        if not any(key in data for key in minimal_keys):
+            raise self._generation_validation_error(
+                GenerationErrorCode.SCHEMA_VALIDATION_FAILED,
+                reason="minimal_contract_failed",
+                message="analysis JSON does not contain any minimal parser field",
+            )
+        if "sentiment_score" in data:
+            try:
+                int(data.get("sentiment_score", 50))
+            except (TypeError, ValueError) as exc:
+                raise self._generation_validation_error(
+                    GenerationErrorCode.SCHEMA_VALIDATION_FAILED,
+                    reason="parser_contract_failed",
+                    message="sentiment_score must be integer-compatible",
+                ) from exc
+
+    def _generation_validation_error(
+        self,
+        error_code: GenerationErrorCode,
+        *,
+        reason: str,
+        message: str,
+    ) -> GenerationError:
+        try:
+            backend_id, _fallback_backend_id = self._resolve_generation_backend_config()
+        except GenerationError:
+            backend_id = "generation_backend"
+        return GenerationError(
+            error_code=error_code,
+            stage="validation",
+            retryable=True,
+            fallbackable=True,
+            backend=backend_id,
+            provider=backend_id,
+            details={
+                "reason": reason,
+                "message": message,
+            },
+        )
+
     def _parse_response(
         self, 
         response_text: str, 
@@ -3292,95 +4269,77 @@ class GeminiAnalyzer:
             report_language = normalize_report_language(
                 getattr(self._get_runtime_config(), "report_language", "zh")
             )
-            # 清理响应文本：移除 markdown 代码块标记
-            cleaned_text = response_text
-            if '```json' in cleaned_text:
-                cleaned_text = cleaned_text.replace('```json', '').replace('```', '')
-            elif '```' in cleaned_text:
-                cleaned_text = cleaned_text.replace('```', '')
-            
-            # 尝试找到 JSON 内容
-            json_start = cleaned_text.find('{')
-            json_end = cleaned_text.rfind('}') + 1
-            
-            if json_start >= 0 and json_end > json_start:
-                json_str = cleaned_text[json_start:json_end]
-                
-                # 尝试修复常见的 JSON 问题
-                json_str = self._fix_json_string(json_str)
-                
-                data = json.loads(json_str)
-
-                # Schema validation (lenient: on failure, continue with raw dict)
-                try:
-                    AnalysisReportSchema.model_validate(data)
-                except Exception as e:
-                    logger.warning(
-                        "LLM report schema validation failed, continuing with raw dict: %s",
-                        str(e)[:100],
-                    )
-
-                # 提取 dashboard 数据
-                dashboard = data.get('dashboard', None)
-
-                # 优先使用 AI 返回的股票名称（如果原名称无效或包含代码）
-                ai_stock_name = data.get('stock_name')
-                if ai_stock_name and (name.startswith('股票') or name == code or 'Unknown' in name):
-                    name = ai_stock_name
-
-                # 解析所有字段，使用默认值防止缺失
-                # 解析 decision_type，如果没有则根据 operation_advice 推断
-                decision_type = data.get('decision_type', '')
-                if not decision_type:
-                    op = data.get('operation_advice', 'Hold' if report_language == "en" else '持有')
-                    decision_type = infer_decision_type_from_advice(op, default='hold')
-                
-                return AnalysisResult(
-                    code=code,
-                    name=name,
-                    # 核心指标
-                    sentiment_score=int(data.get('sentiment_score', 50)),
-                    trend_prediction=data.get('trend_prediction', 'Sideways' if report_language == "en" else '震荡'),
-                    operation_advice=data.get('operation_advice', 'Hold' if report_language == "en" else '持有'),
-                    decision_type=decision_type,
-                    confidence_level=localize_confidence_level(
-                        data.get('confidence_level', 'Medium' if report_language == "en" else '中'),
-                        report_language,
-                    ),
-                    report_language=report_language,
-                    # 决策仪表盘
-                    dashboard=dashboard,
-                    # 走势分析
-                    trend_analysis=data.get('trend_analysis', ''),
-                    short_term_outlook=data.get('short_term_outlook', ''),
-                    medium_term_outlook=data.get('medium_term_outlook', ''),
-                    # 技术面
-                    technical_analysis=data.get('technical_analysis', ''),
-                    ma_analysis=data.get('ma_analysis', ''),
-                    volume_analysis=data.get('volume_analysis', ''),
-                    pattern_analysis=data.get('pattern_analysis', ''),
-                    # 基本面
-                    fundamental_analysis=data.get('fundamental_analysis', ''),
-                    sector_position=data.get('sector_position', ''),
-                    company_highlights=data.get('company_highlights', ''),
-                    # 情绪面/消息面
-                    news_summary=data.get('news_summary', ''),
-                    market_sentiment=data.get('market_sentiment', ''),
-                    hot_topics=data.get('hot_topics', ''),
-                    # 综合
-                    analysis_summary=data.get('analysis_summary', 'Analysis completed' if report_language == "en" else '分析完成'),
-                    key_points=data.get('key_points', ''),
-                    risk_warning=data.get('risk_warning', ''),
-                    buy_reason=data.get('buy_reason', ''),
-                    # 元数据
-                    search_performed=data.get('search_performed', False),
-                    data_sources=data.get('data_sources', 'Technical data' if report_language == "en" else '技术面数据'),
-                    success=True,
-                )
-            else:
-                # 没有找到 JSON，标记为失败
-                logger.warning(f"无法从响应中提取 JSON，标记为解析失败")
+            try:
+                _json_str, data = self._extract_analysis_json_object(response_text)
+                self._validate_analysis_minimal_contract(data)
+            except Exception as exc:
+                logger.warning("无法从响应中提取唯一有效 JSON，标记为解析失败: %s", exc)
                 return self._parse_text_response(response_text, code, name)
+
+            # 提取 dashboard 数据
+            dashboard = data.get('dashboard', None)
+            # 归一化 signal_attribution（LLM 可能返回字符串/负数/总和≠100）
+            normalize_report_signal_attribution(dashboard)
+
+            # 优先使用 AI 返回的股票名称（如果原名称无效或包含代码）
+            ai_stock_name = data.get('stock_name')
+            if ai_stock_name and (name.startswith('股票') or name == code or 'Unknown' in name):
+                name = ai_stock_name
+
+            # 解析所有字段，使用默认值防止缺失
+            # 解析 decision_type，如果没有则根据 operation_advice 推断
+            decision_type = data.get('decision_type', '')
+            if not decision_type:
+                op = data.get('operation_advice', 'Hold' if report_language == "en" else '持有')
+                decision_type = infer_decision_type_from_advice(op, default='hold')
+
+            explicit_action = data.get("action")
+            if explicit_action is None and isinstance(dashboard, dict):
+                explicit_action = dashboard.get("action")
+
+            result = AnalysisResult(
+                code=code,
+                name=name,
+                # 核心指标
+                sentiment_score=int(data.get('sentiment_score', 50)),
+                trend_prediction=data.get('trend_prediction', 'Sideways' if report_language == "en" else '震荡'),
+                operation_advice=data.get('operation_advice', 'Hold' if report_language == "en" else '持有'),
+                decision_type=decision_type,
+                confidence_level=localize_confidence_level(
+                    data.get('confidence_level', 'Medium' if report_language == "en" else '中'),
+                    report_language,
+                ),
+                report_language=report_language,
+                # 决策仪表盘
+                dashboard=dashboard,
+                # 走势分析
+                trend_analysis=data.get('trend_analysis', ''),
+                short_term_outlook=data.get('short_term_outlook', ''),
+                medium_term_outlook=data.get('medium_term_outlook', ''),
+                # 技术面
+                technical_analysis=data.get('technical_analysis', ''),
+                ma_analysis=data.get('ma_analysis', ''),
+                volume_analysis=data.get('volume_analysis', ''),
+                pattern_analysis=data.get('pattern_analysis', ''),
+                # 基本面
+                fundamental_analysis=data.get('fundamental_analysis', ''),
+                sector_position=data.get('sector_position', ''),
+                company_highlights=data.get('company_highlights', ''),
+                # 情绪面/消息面
+                news_summary=data.get('news_summary', ''),
+                market_sentiment=data.get('market_sentiment', ''),
+                hot_topics=data.get('hot_topics', ''),
+                # 综合
+                analysis_summary=data.get('analysis_summary', 'Analysis completed' if report_language == "en" else '分析完成'),
+                key_points=data.get('key_points', ''),
+                risk_warning=data.get('risk_warning', ''),
+                buy_reason=data.get('buy_reason', ''),
+                # 元数据
+                search_performed=data.get('search_performed', False),
+                data_sources=data.get('data_sources', 'Technical data' if report_language == "en" else '技术面数据'),
+                success=True,
+            )
+            return populate_decision_action_fields(result, explicit_action=explicit_action)
                 
         except json.JSONDecodeError as e:
             logger.warning(f"JSON 解析失败: {e}，标记为解析失败")
@@ -3407,32 +4366,44 @@ class GeminiAnalyzer:
         return json_str
 
     def _validate_json_response(self, text: str) -> None:
-        """Validate that *text* contains a parseable JSON object.
+        """Validate that *text* contains one parser-compatible JSON object.
 
         Used as the ``response_validator`` argument to :meth:`_call_litellm` so
         that a JSON-less or unparseable reply from the primary model is treated
         as a model failure and triggers fallback to the next configured model.
 
         Raises:
-            ValueError: if no JSON object is found in *text*.
-            json.JSONDecodeError: if the extracted JSON cannot be parsed (after
-                :meth:`_fix_json_string` attempts repair).
+            GenerationError: if the response has no unique parser-compatible
+                JSON object, the selected JSON candidate cannot be parsed, or
+                the parsed object cannot satisfy the minimal parser contract.
         """
-        cleaned = text
-        if "```json" in cleaned:
-            cleaned = cleaned.replace("```json", "").replace("```", "")
-        elif "```" in cleaned:
-            cleaned = cleaned.replace("```", "")
+        try:
+            _json_str, data = self._extract_analysis_json_object(text)
+        except ValueError as exc:
+            reason = str(exc) or "invalid_json"
+            if reason == "ambiguous_json":
+                message = "JSON source is ambiguous"
+            else:
+                message = "No unique JSON object found in LLM response"
+            raise self._generation_validation_error(
+                GenerationErrorCode.INVALID_JSON,
+                reason=reason,
+                message=message,
+            ) from exc
+        except json.JSONDecodeError as exc:
+            raise self._generation_validation_error(
+                GenerationErrorCode.INVALID_JSON,
+                reason="invalid_json",
+                message=str(exc)[:200],
+            ) from exc
+        except Exception as exc:
+            raise self._generation_validation_error(
+                GenerationErrorCode.INVALID_JSON,
+                reason="invalid_json",
+                message=str(exc)[:200],
+            ) from exc
 
-        json_start = cleaned.find("{")
-        json_end = cleaned.rfind("}") + 1
-
-        if json_start < 0 or json_end <= json_start:
-            raise ValueError("No JSON object found in LLM response")
-
-        json_str = cleaned[json_start:json_end]
-        json_str = self._fix_json_string(json_str)
-        json.loads(json_str)
+        self._validate_analysis_minimal_contract(data)
     
     def _parse_text_response(
         self, 
@@ -3474,7 +4445,7 @@ class GeminiAnalyzer:
         # 截取前500字符作为摘要
         summary = response_text[:500] if response_text else ('No analysis result' if report_language == "en" else '无分析结果')
         
-        return AnalysisResult(
+        result = AnalysisResult(
             code=code,
             name=name,
             sentiment_score=sentiment_score,
@@ -3490,6 +4461,7 @@ class GeminiAnalyzer:
             error_message='LLM response is not valid JSON; analysis result will not be persisted',
             report_language=report_language,
         )
+        return populate_decision_action_fields(result)
     
     def batch_analyze(
         self, 
