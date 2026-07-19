@@ -3853,13 +3853,14 @@ class GeminiAnalyzer:
         if macd_7d and isinstance(macd_7d, list) and len(macd_7d) >= 3:
             prompt += f"""
 ### 📊 MACD 指标深度分析（近7个交易日）
-| 日期 | 收盘价 | 涨跌幅 | DIF | DEA | MACD柱 | 柱体方向 |
-|------|--------|--------|-----|-----|--------|----------|
+| 日期 | 收盘价 | 涨跌幅 | DIF | DEA | MACD柱 | MACD柱波动比例 | 柱体方向 |
+|------|--------|--------|-----|-----|--------|----------|----------|
 """
             for day in macd_7d[-7:]:
                 bar_dir = "🟥" if day.get('bar_direction') == 'red' else "🟩"
                 chg = f"{day.get('change_pct', ''):+.2f}%" if day.get('change_pct') is not None else "N/A"
-                prompt += f"| {day.get('date', '')} | {day.get('close', 0):.2f} | {chg} | {day.get('dif', 0):.4f} | {day.get('dea', 0):.4f} | {day.get('bar', 0):.4f} | {bar_dir} |\n"
+                bar_chg = f"{day.get('bar_change_pct', ''):+.2f}%" if day.get('bar_change_pct') is not None else "N/A"
+                prompt += f"| {day.get('date', '')} | {day.get('close', 0):.2f} | {chg} | {day.get('dif', 0):.4f} | {day.get('dea', 0):.4f} | {day.get('bar', 0):.4f} | {bar_chg} | {bar_dir} |\n"
 
             # 趋势分析标注
             if macd_annotations:

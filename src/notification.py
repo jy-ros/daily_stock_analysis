@@ -1334,14 +1334,15 @@ class NotificationService(
                     report_lines.extend([
                         f"### 📊 {labels.get('macd_heading', 'MACD 指标深度分析')}",
                         "",
-                        f"| {labels.get('macd_date_label', '日期')} | {labels.get('macd_close_label', '收盘价')} | {labels.get('macd_change_label', '涨跌幅')} | {labels.get('macd_dif_label', 'DIF')} | {labels.get('macd_dea_label', 'DEA')} | {labels.get('macd_bar_label', 'MACD柱')} | {labels.get('macd_direction_label', '柱体方向')} |",
-                        "|------|--------|--------|-----|-----|--------|----------|",
+                        f"| {labels.get('macd_date_label', '日期')} | {labels.get('macd_close_label', '收盘价')} | {labels.get('macd_change_label', '涨跌幅')} | {labels.get('macd_dif_label', 'DIF')} | {labels.get('macd_dea_label', 'DEA')} | {labels.get('macd_bar_label', 'MACD柱')} | {labels.get('macd_bar_change_label', 'MACD柱波动比例')} | {labels.get('macd_direction_label', '柱体方向')} |",
+                        "|------|--------|--------|-----|-----|--------|----------|----------|",
                     ])
                     for day in macd_days[-7:]:
                         change_str = f"{day.get('change_pct', ''):+.2f}%" if day.get('change_pct') is not None else 'N/A'
+                        bar_change_str = f"{day.get('bar_change_pct', ''):+.2f}%" if day.get('bar_change_pct') is not None else 'N/A'
                         bar_icon = labels.get('macd_red_bar', '🟥') if day.get('bar_direction') == 'red' else labels.get('macd_green_bar', '🟩')
                         report_lines.append(
-                            f"| {day.get('date', '')} | {day.get('close', 0):.2f} | {change_str} | {day.get('dif', 0):.4f} | {day.get('dea', 0):.4f} | {day.get('bar', 0):.4f} | {bar_icon} |"
+                            f"| {day.get('date', '')} | {day.get('close', 0):.2f} | {change_str} | {day.get('dif', 0):.4f} | {day.get('dea', 0):.4f} | {day.get('bar', 0):.4f} | {bar_change_str} | {bar_icon} |"
                         )
                     report_lines.append("")
 

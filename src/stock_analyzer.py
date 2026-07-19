@@ -606,6 +606,15 @@ class StockTrendAnalyzer:
             # 7日 MACD 数据列表
             result.macd_7d_days = raw["days"]
 
+            # 计算 MACD 柱波动比例（相对前一天）
+            prev_bar = None
+            for day in result.macd_7d_days:
+                if prev_bar is not None and prev_bar != 0:
+                    day["bar_change_pct"] = round((day["bar"] - prev_bar) / abs(prev_bar) * 100, 2)
+                else:
+                    day["bar_change_pct"] = None
+                prev_bar = day["bar"]
+
             # DIF 趋势
             result.macd_trend_direction = raw["dif_trend"]["direction"]
             result.macd_trend_streak = raw["dif_trend"]["streak"]
