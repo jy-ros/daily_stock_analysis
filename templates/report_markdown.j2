@@ -165,6 +165,20 @@
 {% endfor %}
 {% endif %}
 
+{% if result.macd_bearish_divergence or result.macd_bullish_divergence %}
+**{{ labels.macd_divergence_label }}**:
+{% if result.macd_bearish_divergence %}
+- {{ labels.macd_bearish_divergence }}: {{ result.macd_divergence_desc }}
+{% endif %}
+{% if result.macd_bullish_divergence %}
+- {{ labels.macd_bullish_divergence }}: {{ result.macd_divergence_desc }}
+{% endif %}
+{% endif %}
+
+{% if result.macd_composite_score is defined %}
+**{{ labels.macd_composite_score_label }}**: {{ result.macd_composite_score }}/100
+{% endif %}
+
 {% endif %}
 
 {% set signal_attr = dashboard.get('signal_attribution') or {} %}

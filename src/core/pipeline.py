@@ -751,6 +751,20 @@ class StockAnalysisPipeline:
                     result.macd_annotations = trend_result.macd_annotations
                     result.macd_trend_direction = trend_result.macd_trend_direction
                     result.macd_trend_streak = trend_result.macd_trend_streak
+                    result.macd_bar_trend_direction = trend_result.macd_bar_trend_direction
+                    result.macd_bar_trend_streak = trend_result.macd_bar_trend_streak
+                    result.macd_turning_point = trend_result.macd_turning_point
+                    result.macd_turning_point_desc = trend_result.macd_turning_point_desc
+                    result.macd_golden_cross = trend_result.macd_golden_cross
+                    result.macd_death_cross = trend_result.macd_death_cross
+                    result.macd_cross_desc = trend_result.macd_cross_desc
+                    result.macd_dif_change_pct = trend_result.macd_dif_change_pct
+                    result.macd_bearish_divergence = trend_result.macd_bearish_divergence
+                    result.macd_bullish_divergence = trend_result.macd_bullish_divergence
+                    result.macd_divergence_desc = trend_result.macd_divergence_desc
+                    result.macd_bar_strength = trend_result.macd_bar_strength
+                    result.macd_is_noisy = trend_result.macd_is_noisy
+                    result.macd_composite_score = trend_result.macd_composite_score
                 adjustments = apply_phase_decision_guardrails(
                     result,
                     market_phase_summary=market_phase_summary,
@@ -948,6 +962,12 @@ class StockAnalysisPipeline:
                 'macd_cross_desc': trend_result.macd_cross_desc,
                 'macd_dif_change_pct': trend_result.macd_dif_change_pct,
                 'macd_7d_days': trend_result.macd_7d_days,
+                'macd_bearish_divergence': trend_result.macd_bearish_divergence,
+                'macd_bullish_divergence': trend_result.macd_bullish_divergence,
+                'macd_divergence_desc': trend_result.macd_divergence_desc,
+                'macd_bar_strength': trend_result.macd_bar_strength,
+                'macd_is_noisy': trend_result.macd_is_noisy,
+                'macd_composite_score': trend_result.macd_composite_score,
             }
 
         # Issue #234：盘中分析使用实时 OHLC 与趋势 MA 覆盖 today。
@@ -1408,6 +1428,20 @@ class StockAnalysisPipeline:
                     result.macd_annotations = trend_result.macd_annotations
                     result.macd_trend_direction = trend_result.macd_trend_direction
                     result.macd_trend_streak = trend_result.macd_trend_streak
+                    result.macd_bar_trend_direction = trend_result.macd_bar_trend_direction
+                    result.macd_bar_trend_streak = trend_result.macd_bar_trend_streak
+                    result.macd_turning_point = trend_result.macd_turning_point
+                    result.macd_turning_point_desc = trend_result.macd_turning_point_desc
+                    result.macd_golden_cross = trend_result.macd_golden_cross
+                    result.macd_death_cross = trend_result.macd_death_cross
+                    result.macd_cross_desc = trend_result.macd_cross_desc
+                    result.macd_dif_change_pct = trend_result.macd_dif_change_pct
+                    result.macd_bearish_divergence = trend_result.macd_bearish_divergence
+                    result.macd_bullish_divergence = trend_result.macd_bullish_divergence
+                    result.macd_divergence_desc = trend_result.macd_divergence_desc
+                    result.macd_bar_strength = trend_result.macd_bar_strength
+                    result.macd_is_noisy = trend_result.macd_is_noisy
+                    result.macd_composite_score = trend_result.macd_composite_score
                 adjustments = apply_phase_decision_guardrails(
                     result,
                     market_phase_summary=market_phase_summary,

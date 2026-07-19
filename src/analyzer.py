@@ -1652,6 +1652,20 @@ class AnalysisResult:
     macd_annotations: Optional[List[str]] = None  # MACD趋势标注
     macd_trend_direction: str = "neutral"
     macd_trend_streak: int = 0
+    macd_bar_trend_direction: str = "neutral"
+    macd_bar_trend_streak: int = 0
+    macd_turning_point: bool = False
+    macd_turning_point_desc: str = ""
+    macd_golden_cross: bool = False
+    macd_death_cross: bool = False
+    macd_cross_desc: str = ""
+    macd_dif_change_pct: Optional[float] = None
+    macd_bearish_divergence: bool = False
+    macd_bullish_divergence: bool = False
+    macd_divergence_desc: str = ""
+    macd_bar_strength: float = 1.0
+    macd_is_noisy: bool = False
+    macd_composite_score: int = 50
 
     # ========== 基本面上下文（仅运行时，用于通知拼装；不持久化到 to_dict）==========
     fundamental_context: Optional[Dict[str, Any]] = None
@@ -1698,6 +1712,20 @@ class AnalysisResult:
             'macd_annotations': self.macd_annotations,
             'macd_trend_direction': self.macd_trend_direction,
             'macd_trend_streak': self.macd_trend_streak,
+            'macd_bar_trend_direction': self.macd_bar_trend_direction,
+            'macd_bar_trend_streak': self.macd_bar_trend_streak,
+            'macd_turning_point': self.macd_turning_point,
+            'macd_turning_point_desc': self.macd_turning_point_desc,
+            'macd_golden_cross': self.macd_golden_cross,
+            'macd_death_cross': self.macd_death_cross,
+            'macd_cross_desc': self.macd_cross_desc,
+            'macd_dif_change_pct': self.macd_dif_change_pct,
+            'macd_bearish_divergence': self.macd_bearish_divergence,
+            'macd_bullish_divergence': self.macd_bullish_divergence,
+            'macd_divergence_desc': self.macd_divergence_desc,
+            'macd_bar_strength': self.macd_bar_strength,
+            'macd_is_noisy': self.macd_is_noisy,
+            'macd_composite_score': self.macd_composite_score,
         }
 
     def get_core_conclusion(self) -> str:
@@ -3815,6 +3843,12 @@ class GeminiAnalyzer:
         macd_dc = context.get('trend_analysis', {}).get('macd_death_cross', False)
         macd_cross_desc = context.get('trend_analysis', {}).get('macd_cross_desc', '')
         macd_dif_chg = context.get('trend_analysis', {}).get('macd_dif_change_pct')
+        macd_bearish_div = context.get('trend_analysis', {}).get('macd_bearish_divergence', False)
+        macd_bullish_div = context.get('trend_analysis', {}).get('macd_bullish_divergence', False)
+        macd_div_desc = context.get('trend_analysis', {}).get('macd_divergence_desc', '')
+        macd_composite_score = context.get('trend_analysis', {}).get('macd_composite_score', 50)
+        macd_is_noisy = context.get('trend_analysis', {}).get('macd_is_noisy', False)
+        macd_bar_strength = context.get('trend_analysis', {}).get('macd_bar_strength', 1.0)
 
         if macd_7d and isinstance(macd_7d, list) and len(macd_7d) >= 3:
             prompt += f"""
@@ -3866,6 +3900,23 @@ class GeminiAnalyzer:
             if macd_gc or macd_dc:
                 prompt += f"""
 **交叉信号**：{macd_cross_desc}
+"""
+
+            # 背离检测
+            if macd_bearish_div or macd_bullish_div:
+                prompt += f"""
+**背离检测**：{macd_div_desc}
+"""
+
+            # 柱体强度 & 噪音区
+            if macd_is_noisy:
+                prompt += f"""
+**柱体强度**：当前柱体强度 {macd_bar_strength:.2f}，处于噪音区，信号可靠性降低。
+"""
+
+            # MACD 复合评分
+            prompt += f"""
+**MACD 复合评分**：{macd_composite_score}/100（综合 DIF 趋势、柱体趋势、交叉信号、零轴位置、背离情况）
 """
         else:
             prompt += """
