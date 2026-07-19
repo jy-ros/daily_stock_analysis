@@ -177,7 +177,18 @@
 {% endif %}
 
 {% if result.macd_composite_score is defined %}
-**{{ labels.macd_composite_score_label }}**: {{ result.macd_composite_score }}/100
+{% if result.macd_composite_score >= 80 %}
+{% set score_level = labels.macd_composite_score_strong_bullish %}
+{% elif result.macd_composite_score >= 60 %}
+{% set score_level = labels.macd_composite_score_bullish %}
+{% elif result.macd_composite_score >= 40 %}
+{% set score_level = labels.macd_composite_score_neutral %}
+{% elif result.macd_composite_score >= 20 %}
+{% set score_level = labels.macd_composite_score_bearish %}
+{% else %}
+{% set score_level = labels.macd_composite_score_strong_bearish %}
+{% endif %}
+**{{ labels.macd_composite_score_label }}**: {{ result.macd_composite_score }}/100（{{ score_level }}）
 {% endif %}
 
 {% endif %}

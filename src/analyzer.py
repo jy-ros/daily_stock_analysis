@@ -3916,8 +3916,13 @@ class GeminiAnalyzer:
 """
 
             # MACD 复合评分
+            score_level = "强势偏多" if macd_composite_score >= 80 else \
+                          "偏多" if macd_composite_score >= 60 else \
+                          "中性/震荡" if macd_composite_score >= 40 else \
+                          "偏空" if macd_composite_score >= 20 else \
+                          "强烈偏空"
             prompt += f"""
-**MACD 复合评分**：{macd_composite_score}/100（综合 DIF 趋势、柱体趋势、交叉信号、零轴位置、背离情况）
+**MACD 复合评分**：{macd_composite_score}/100（{score_level}，综合 DIF 趋势、柱体趋势、交叉信号、零轴位置、背离情况）
 """
         else:
             prompt += """

@@ -1365,7 +1365,17 @@ class NotificationService(
 
                     composite_score = getattr(result, 'macd_composite_score', None)
                     if composite_score is not None:
-                        report_lines.append(f"**{labels.get('macd_composite_score_label', 'MACD 复合评分')}**: {composite_score}/100")
+                        if composite_score >= 80:
+                            level = labels.get('macd_composite_score_strong_bullish', '强势偏多')
+                        elif composite_score >= 60:
+                            level = labels.get('macd_composite_score_bullish', '偏多')
+                        elif composite_score >= 40:
+                            level = labels.get('macd_composite_score_neutral', '中性/震荡')
+                        elif composite_score >= 20:
+                            level = labels.get('macd_composite_score_bearish', '偏空')
+                        else:
+                            level = labels.get('macd_composite_score_strong_bearish', '强烈偏空')
+                        report_lines.append(f"**{labels.get('macd_composite_score_label', 'MACD 复合评分')}**: {composite_score}/100（{level}）")
                         report_lines.append("")
 
                 # ========== 作战计划 ==========
