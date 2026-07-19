@@ -134,6 +134,12 @@ class TrendAnalysisResult:
     macd_cross_desc: str = ""
     macd_dif_change_pct: Optional[float] = None
     macd_7d_analysis_raw: Optional[Dict[str, Any]] = None  # 原始分析数据供LLM prompt使用
+    macd_bearish_divergence: bool = False
+    macd_bullish_divergence: bool = False
+    macd_divergence_desc: str = ""
+    macd_bar_strength: float = 1.0
+    macd_is_noisy: bool = False
+    macd_composite_score: int = 50
 
     # RSI 指标
     rsi_6: float = 0.0              # RSI(6) 短期
@@ -188,6 +194,12 @@ class TrendAnalysisResult:
             'macd_death_cross': self.macd_death_cross,
             'macd_cross_desc': self.macd_cross_desc,
             'macd_dif_change_pct': self.macd_dif_change_pct,
+            'macd_bearish_divergence': self.macd_bearish_divergence,
+            'macd_bullish_divergence': self.macd_bullish_divergence,
+            'macd_divergence_desc': self.macd_divergence_desc,
+            'macd_bar_strength': self.macd_bar_strength,
+            'macd_is_noisy': self.macd_is_noisy,
+            'macd_composite_score': self.macd_composite_score,
             'rsi_6': self.rsi_6,
             'rsi_12': self.rsi_12,
             'rsi_24': self.rsi_24,
@@ -616,6 +628,14 @@ class StockTrendAnalyzer:
 
             # 综合标注
             result.macd_annotations = raw["annotations"]
+
+            # 背离检测
+            result.macd_bearish_divergence = raw["divergence"]["bearish"]
+            result.macd_bullish_divergence = raw["divergence"]["bullish"]
+            result.macd_divergence_desc = raw["divergence"]["description"]
+            result.macd_bar_strength = raw["bar_strength"]
+            result.macd_is_noisy = raw["is_noisy"]
+            result.macd_composite_score = raw["composite_score"]
 
             # 保存原始分析数据供 LLM prompt 使用
             result.macd_7d_analysis_raw = raw
