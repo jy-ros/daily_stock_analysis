@@ -12,6 +12,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 <!-- 新条目格式：- [类型] 描述（类型取值：新功能/改进/修复/文档/测试/chore）-->
 <!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->
 
+## [3.24.2] - 2026-07-19
+- [新功能] 新增 MACD 7日趋势深度分析模块 `src/macd_analyzer.py`，支持连续趋势检测、趋势加速/转折点预警、金叉/死叉标注
+- [改进] `StockTrendAnalyzer._analyze_macd` 集成 7 日 MACD 趋势分析，包含 DIF 连续上涨/下跌趋势、红绿柱变化趋势、转折点检测
+- [改进] `TrendAnalysisResult` 新增 `macd_trend_direction`/`macd_trend_streak`/`macd_annotations`/`macd_golden_cross`/`macd_death_cross` 等 13 个 MACD 分析字段
+- [改进] 分析 Prompt 增加 MACD 深度分析章节，展示近 7 日 MACD 数据列表及趋势标注，供 LLM 生成更准确的报告
+- [改进] 分析上下文 `enhanced_context` 中 `trend_analysis` 区块新增 MACD 趋势数据
+- [改进] 最终渲染报告（Jinja2 模板）新增 MACD 数据表格，展示近 7 日收盘价、涨跌幅、DIF、DEA、MACD 柱及柱体方向
+- [改进] `AnalysisResult` 新增 `macd_7d_days`/`macd_annotations` 字段，供报告渲染和 API 使用
+- [改进] `report_language.py` 新增中英文 MACD 标签
+
 ## [3.24.1] - 2026-06-28
 
 ### 修复

@@ -145,6 +145,28 @@
 
 {% endif %}
 
+{% set macd_days = result.macd_7d_days or [] %}
+{% if macd_days|length >= 3 %}
+### 📊 {{ labels.macd_heading }}
+
+| {{ labels.macd_date_label }} | {{ labels.macd_close_label }} | {{ labels.macd_change_label }} | {{ labels.macd_dif_label }} | {{ labels.macd_dea_label }} | {{ labels.macd_bar_label }} | {{ labels.macd_direction_label }} |
+|------|--------|--------|-----|-----|--------|----------|
+{% for day in macd_days[-7:] %}
+{% set change_str = '%+.2f%%' % day.change_pct if day.change_pct is not none else 'N/A' %}
+{% set bar_icon = labels.macd_red_bar if day.bar_direction == 'red' else labels.macd_green_bar %}
+| {{ day.date }} | {{ '%.2f' % day.close }} | {{ change_str }} | {{ '%.4f' % day.dif }} | {{ '%.4f' % day.dea }} | {{ '%.4f' % day.bar }} | {{ bar_icon }} |
+{% endfor %}
+
+{% set macd_anns = result.macd_annotations or [] %}
+{% if macd_anns %}
+**{{ labels.macd_annotations_label }}**:
+{% for ann in macd_anns %}
+- {{ ann }}
+{% endfor %}
+{% endif %}
+
+{% endif %}
+
 {% set signal_attr = dashboard.get('signal_attribution') or {} %}
 {% set signal_attr_weights = signal_attribution_weight_items(signal_attr) %}
 {% if signal_attribution_has_content(signal_attr) %}

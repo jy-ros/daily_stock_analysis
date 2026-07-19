@@ -18,13 +18,14 @@
 
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from enum import Enum
 
 import pandas as pd
 import numpy as np
 
 from src.config import get_config
+from src.macd_analyzer import analyze_macd
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +120,21 @@ class TrendAnalysisResult:
     macd_status: MACDStatus = MACDStatus.BULLISH
     macd_signal: str = ""            # MACD 信号描述
 
+    # MACD 深度分析（7日趋势）
+    macd_7d_days: List[Dict[str, Any]] = field(default_factory=list)
+    macd_annotations: List[str] = field(default_factory=list)
+    macd_trend_direction: str = "neutral"  # upward/downward/neutral
+    macd_trend_streak: int = 0
+    macd_bar_trend_direction: str = "neutral"
+    macd_bar_trend_streak: int = 0
+    macd_turning_point: bool = False
+    macd_turning_point_desc: str = ""
+    macd_golden_cross: bool = False
+    macd_death_cross: bool = False
+    macd_cross_desc: str = ""
+    macd_dif_change_pct: Optional[float] = None
+    macd_7d_analysis_raw: Optional[Dict[str, Any]] = None  # 原始分析数据供LLM prompt使用
+
     # RSI 指标
     rsi_6: float = 0.0              # RSI(6) 短期
     rsi_12: float = 0.0             # RSI(12) 中期
@@ -160,6 +176,18 @@ class TrendAnalysisResult:
             'macd_bar': self.macd_bar,
             'macd_status': self.macd_status.value,
             'macd_signal': self.macd_signal,
+            'macd_7d_days': self.macd_7d_days,
+            'macd_annotations': self.macd_annotations,
+            'macd_trend_direction': self.macd_trend_direction,
+            'macd_trend_streak': self.macd_trend_streak,
+            'macd_bar_trend_direction': self.macd_bar_trend_direction,
+            'macd_bar_trend_streak': self.macd_bar_trend_streak,
+            'macd_turning_point': self.macd_turning_point,
+            'macd_turning_point_desc': self.macd_turning_point_desc,
+            'macd_golden_cross': self.macd_golden_cross,
+            'macd_death_cross': self.macd_death_cross,
+            'macd_cross_desc': self.macd_cross_desc,
+            'macd_dif_change_pct': self.macd_dif_change_pct,
             'rsi_6': self.rsi_6,
             'rsi_12': self.rsi_12,
             'rsi_24': self.rsi_24,
@@ -480,12 +508,14 @@ class StockTrendAnalyzer:
 
     def _analyze_macd(self, df: pd.DataFrame, result: TrendAnalysisResult) -> None:
         """
-        分析 MACD 指标
+        分析 MACD 指标（增强版：包含7日趋势分析）
 
         核心信号：
         - 零轴上金叉：最强买入信号
         - 金叉：DIF 上穿 DEA
         - 死叉：DIF 下穿 DEA
+        - 连续趋势：DIF 连续 3 天上涨/下跌（带动价格趋势）
+        - 趋势加速：DIF 变化幅度扩大 > 20%
         """
         if len(df) < self.MACD_SLOW:
             result.macd_signal = "数据不足"
@@ -540,6 +570,59 @@ class StockTrendAnalyzer:
         else:
             result.macd_status = MACDStatus.BULLISH
             result.macd_signal = " MACD 中性区域"
+
+        # 深度 MACD 趋势分析（7日）
+        self._analyze_macd_trend(df, result)
+
+    def _analyze_macd_trend(self, df: pd.DataFrame, result: TrendAnalysisResult) -> None:
+        """
+        进行 MACD 7日趋势深度分析。
+
+        分析项目：
+        1. DIF 连续趋势（>=3天）
+        2. 红绿柱连续趋势
+        3. 趋势加速/转折点
+        4. 金叉/死叉检测
+        5. 生成结构化的标注和输出
+        """
+        try:
+            macd_result = analyze_macd(df)
+
+            # 获取原始分析数据
+            raw = macd_result.to_dict()
+
+            # 7日 MACD 数据列表
+            result.macd_7d_days = raw["days"]
+
+            # DIF 趋势
+            result.macd_trend_direction = raw["dif_trend"]["direction"]
+            result.macd_trend_streak = raw["dif_trend"]["streak"]
+
+            # 红绿柱趋势
+            result.macd_bar_trend_direction = raw["bar_trend"]["direction"]
+            result.macd_bar_trend_streak = raw["bar_trend"]["streak"]
+
+            # 转折点
+            result.macd_turning_point = raw["turning_point"]["detected"]
+            result.macd_turning_point_desc = raw["turning_point"]["description"]
+
+            # 金叉/死叉
+            result.macd_golden_cross = raw["golden_cross"]
+            result.macd_death_cross = raw["death_cross"]
+            result.macd_cross_desc = raw["cross_description"]
+
+            # DIF 变化幅度
+            result.macd_dif_change_pct = raw["latest"]["dif_change_pct"]
+
+            # 综合标注
+            result.macd_annotations = raw["annotations"]
+
+            # 保存原始分析数据供 LLM prompt 使用
+            result.macd_7d_analysis_raw = raw
+
+        except Exception as e:
+            logger.warning(f"[{result.code}] MACD 7日趋势分析失败: {e}")
+            # 不阻断主流程，降级为仅保留基础 MACD
 
     def _analyze_rsi(self, df: pd.DataFrame, result: TrendAnalysisResult) -> None:
         """

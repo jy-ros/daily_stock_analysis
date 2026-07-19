@@ -745,6 +745,12 @@ class StockAnalysisPipeline:
                 fill_price_position_if_needed(result, trend_result, realtime_quote)
                 action_source_advice = getattr(result, "operation_advice", None)
                 stabilize_decision_with_structure(result, trend_result, fundamental_context)
+                # 注入 MACD 7日分析数据到 result（供报告渲染）
+                if trend_result:
+                    result.macd_7d_days = trend_result.macd_7d_days
+                    result.macd_annotations = trend_result.macd_annotations
+                    result.macd_trend_direction = trend_result.macd_trend_direction
+                    result.macd_trend_streak = trend_result.macd_trend_streak
                 adjustments = apply_phase_decision_guardrails(
                     result,
                     market_phase_summary=market_phase_summary,
@@ -929,6 +935,19 @@ class StockAnalysisPipeline:
                 'signal_score': trend_result.signal_score,
                 'signal_reasons': trend_result.signal_reasons,
                 'risk_factors': trend_result.risk_factors,
+                # MACD 深度分析（7日趋势）
+                'macd_annotations': trend_result.macd_annotations,
+                'macd_trend_direction': trend_result.macd_trend_direction,
+                'macd_trend_streak': trend_result.macd_trend_streak,
+                'macd_bar_trend_direction': trend_result.macd_bar_trend_direction,
+                'macd_bar_trend_streak': trend_result.macd_bar_trend_streak,
+                'macd_turning_point': trend_result.macd_turning_point,
+                'macd_turning_point_desc': trend_result.macd_turning_point_desc,
+                'macd_golden_cross': trend_result.macd_golden_cross,
+                'macd_death_cross': trend_result.macd_death_cross,
+                'macd_cross_desc': trend_result.macd_cross_desc,
+                'macd_dif_change_pct': trend_result.macd_dif_change_pct,
+                'macd_7d_days': trend_result.macd_7d_days,
             }
 
         # Issue #234：盘中分析使用实时 OHLC 与趋势 MA 覆盖 today。
@@ -1383,6 +1402,12 @@ class StockAnalysisPipeline:
                     result.change_pct = realtime_data.get("change_pct")
                 action_source_advice = getattr(result, "operation_advice", None)
                 stabilize_decision_with_structure(result, trend_result, fundamental_context)
+                # 注入 MACD 7日分析数据到 result（供报告渲染）
+                if trend_result:
+                    result.macd_7d_days = trend_result.macd_7d_days
+                    result.macd_annotations = trend_result.macd_annotations
+                    result.macd_trend_direction = trend_result.macd_trend_direction
+                    result.macd_trend_streak = trend_result.macd_trend_streak
                 adjustments = apply_phase_decision_guardrails(
                     result,
                     market_phase_summary=market_phase_summary,

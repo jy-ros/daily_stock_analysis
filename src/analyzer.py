@@ -1647,6 +1647,12 @@ class AnalysisResult:
     # ========== 历史对比（Report Engine P0）==========
     query_id: Optional[str] = None  # 本次分析 query_id，用于历史对比时排除本次记录
 
+    # ========== MACD 7日深度分析数据（供报告渲染使用）==========
+    macd_7d_days: Optional[List[Dict[str, Any]]] = None  # 近7日MACD数据列表
+    macd_annotations: Optional[List[str]] = None  # MACD趋势标注
+    macd_trend_direction: str = "neutral"
+    macd_trend_streak: int = 0
+
     # ========== 基本面上下文（仅运行时，用于通知拼装；不持久化到 to_dict）==========
     fundamental_context: Optional[Dict[str, Any]] = None
 
@@ -1688,6 +1694,10 @@ class AnalysisResult:
             'current_price': self.current_price,
             'change_pct': self.change_pct,
             'model_used': self.model_used,
+            'macd_7d_days': self.macd_7d_days,
+            'macd_annotations': self.macd_annotations,
+            'macd_trend_direction': self.macd_trend_direction,
+            'macd_trend_streak': self.macd_trend_streak,
         }
 
     def get_core_conclusion(self) -> str:
@@ -3793,6 +3803,76 @@ class GeminiAnalyzer:
 {chr(10).join('- ' + note for note in consistency_notes)}
 """
         
+        # 添加 MACD 深度分析（7日趋势）
+        macd_7d = context.get('trend_analysis', {}).get('macd_7d_days')
+        macd_annotations = context.get('trend_analysis', {}).get('macd_annotations', [])
+        macd_trend_dir = context.get('trend_analysis', {}).get('macd_trend_direction', 'neutral')
+        macd_trend_streak = context.get('trend_analysis', {}).get('macd_trend_streak', 0)
+        macd_bar_trend_dir = context.get('trend_analysis', {}).get('macd_bar_trend_direction', 'neutral')
+        macd_turning = context.get('trend_analysis', {}).get('macd_turning_point', False)
+        macd_turning_desc = context.get('trend_analysis', {}).get('macd_turning_point_desc', '')
+        macd_gc = context.get('trend_analysis', {}).get('macd_golden_cross', False)
+        macd_dc = context.get('trend_analysis', {}).get('macd_death_cross', False)
+        macd_cross_desc = context.get('trend_analysis', {}).get('macd_cross_desc', '')
+        macd_dif_chg = context.get('trend_analysis', {}).get('macd_dif_change_pct')
+
+        if macd_7d and isinstance(macd_7d, list) and len(macd_7d) >= 3:
+            prompt += f"""
+### 📊 MACD 指标深度分析（近7个交易日）
+| 日期 | 收盘价 | 涨跌幅 | DIF | DEA | MACD柱 | 柱体方向 |
+|------|--------|--------|-----|-----|--------|----------|
+"""
+            for day in macd_7d[-7:]:
+                bar_dir = "🟥" if day.get('bar_direction') == 'red' else "🟩"
+                chg = f"{day.get('change_pct', ''):+.2f}%" if day.get('change_pct') is not None else "N/A"
+                prompt += f"| {day.get('date', '')} | {day.get('close', 0):.2f} | {chg} | {day.get('dif', 0):.4f} | {day.get('dea', 0):.4f} | {day.get('bar', 0):.4f} | {bar_dir} |\n"
+
+            # 趋势分析标注
+            if macd_annotations:
+                prompt += f"""
+
+**MACD 趋势标注**：
+"""
+                for ann in macd_annotations:
+                    prompt += f"- {ann}\n"
+
+            # 趋势方向总结
+            if macd_trend_dir == "upward" and macd_trend_streak >= 3:
+                prompt += f"""
+**趋势结论**：MACD-DIF 已连续 {macd_trend_streak} 天上升，MACD 红柱放大，短期上涨动能增强。
+"""
+                if macd_dif_chg is not None and macd_dif_chg > 0:
+                    prompt += f"""当日 DIF 变化幅度 {macd_dif_chg:.1f}%，动能持续增强。
+"""
+                if macd_turning:
+                    prompt += f"""⚠️ {macd_turning_desc}
+"""
+            elif macd_trend_dir == "downward" and macd_trend_streak >= 3:
+                prompt += f"""
+**趋势结论**：MACD-DIF 已连续 {macd_trend_streak} 天下降，MACD 绿柱放大，短期下跌动能增强。
+"""
+                if macd_dif_chg is not None and macd_dif_chg < 0:
+                    prompt += f"""当日 DIF 变化幅度 {abs(macd_dif_chg):.1f}%，动能持续衰减。
+"""
+                if macd_turning:
+                    prompt += f"""⚠️ {macd_turning_desc}
+"""
+            else:
+                prompt += """
+**趋势结论**：MACD 无明显连续趋势，处于震荡整理阶段。
+"""
+
+            # 金叉/死叉
+            if macd_gc or macd_dc:
+                prompt += f"""
+**交叉信号**：{macd_cross_desc}
+"""
+        else:
+            prompt += """
+### 📊 MACD 指标
+> 数据不足（少于3个交易日），无法进行 MACD 趋势分析。
+"""
+
         # 添加昨日对比数据
         if 'yesterday' in context:
             volume_change = context.get('volume_change_ratio', 'N/A')
