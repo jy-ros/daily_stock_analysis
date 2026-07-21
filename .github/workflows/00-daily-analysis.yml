@@ -44,8 +44,6 @@ jobs:
       
       - name: 检出代码
         uses: actions/checkout@v5
-        with:
-          ref: ${{ github.event_name == 'schedule' && 'my_stock_opt' || github.ref_name }}
       
       - name: 设置 Python 环境
         uses: actions/setup-python@v6
