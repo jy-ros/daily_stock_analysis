@@ -1166,10 +1166,12 @@ class NotificationService(
             for r in sorted_results:
                 _, signal_emoji, _ = self._get_signal_level(r)
                 display_name = self._get_display_name(r, report_language)
+                macd_score = getattr(r, 'macd_composite_score', None)
+                macd_part = f" | MACD {macd_score}/100" if macd_score is not None else ""
                 report_lines.append(
                     f"{signal_emoji} **{display_name}({r.code})**: "
                     f"{localize_operation_advice(r.operation_advice, report_language)} | "
-                    f"{labels['score_label']} {r.sentiment_score} | "
+                    f"{labels['score_label']} {r.sentiment_score}{macd_part} | "
                     f"{localize_trend_prediction(r.trend_prediction, report_language)}"
                 )
             report_lines.extend([
