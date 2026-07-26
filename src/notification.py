@@ -1167,7 +1167,20 @@ class NotificationService(
                 _, signal_emoji, _ = self._get_signal_level(r)
                 display_name = self._get_display_name(r, report_language)
                 macd_score = getattr(r, 'macd_composite_score', None)
-                macd_part = f" | MACD {macd_score}/100" if macd_score is not None else ""
+                if macd_score is not None:
+                    if macd_score >= 80:
+                        macd_level = labels.get('macd_composite_score_strong_bullish', '强势偏多')
+                    elif macd_score >= 60:
+                        macd_level = labels.get('macd_composite_score_bullish', '偏多')
+                    elif macd_score >= 40:
+                        macd_level = labels.get('macd_composite_score_neutral', '中性/震荡')
+                    elif macd_score >= 20:
+                        macd_level = labels.get('macd_composite_score_bearish', '偏空')
+                    else:
+                        macd_level = labels.get('macd_composite_score_strong_bearish', '强烈偏空')
+                    macd_part = f" | MACD {macd_score}/100（{macd_level}）"
+                else:
+                    macd_part = ""
                 report_lines.append(
                     f"{signal_emoji} **{display_name}({r.code})**: "
                     f"{localize_operation_advice(r.operation_advice, report_language)} | "
