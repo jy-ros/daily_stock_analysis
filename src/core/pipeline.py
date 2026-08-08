@@ -763,8 +763,10 @@ class StockAnalysisPipeline:
                     result.macd_bullish_divergence = trend_result.macd_bullish_divergence
                     result.macd_divergence_desc = trend_result.macd_divergence_desc
                     result.macd_bar_strength = trend_result.macd_bar_strength
+                    result.macd_bar_strength = trend_result.macd_bar_strength
                     result.macd_is_noisy = trend_result.macd_is_noisy
                     result.macd_composite_score = trend_result.macd_composite_score
+                    result.quant = trend_result.quant
                 adjustments = apply_phase_decision_guardrails(
                     result,
                     market_phase_summary=market_phase_summary,
@@ -968,6 +970,8 @@ class StockAnalysisPipeline:
                 'macd_bar_strength': trend_result.macd_bar_strength,
                 'macd_is_noisy': trend_result.macd_is_noisy,
                 'macd_composite_score': trend_result.macd_composite_score,
+                # 量化辅助指标（Phase 1）：KDJ/BOLL/ATR/波动率/回撤/VaR
+                'quant': trend_result.quant,
             }
 
         # Issue #234：盘中分析使用实时 OHLC 与趋势 MA 覆盖 today。
@@ -1442,6 +1446,7 @@ class StockAnalysisPipeline:
                     result.macd_bar_strength = trend_result.macd_bar_strength
                     result.macd_is_noisy = trend_result.macd_is_noisy
                     result.macd_composite_score = trend_result.macd_composite_score
+                    result.quant = trend_result.quant
                 adjustments = apply_phase_decision_guardrails(
                     result,
                     market_phase_summary=market_phase_summary,

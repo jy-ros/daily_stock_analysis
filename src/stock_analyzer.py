@@ -26,6 +26,7 @@ import numpy as np
 
 from src.config import get_config
 from src.macd_analyzer import analyze_macd
+from src.quant_indicators import analyze_quant_indicators
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +149,9 @@ class TrendAnalysisResult:
     rsi_status: RSIStatus = RSIStatus.NEUTRAL
     rsi_signal: str = ""              # RSI 信号描述
 
+    # 量化辅助指标（Phase 1）
+    quant: Optional[Dict[str, Any]] = None  # KDJ/BOLL/ATR/波动率/回撤/VaR 见 QuantIndicatorsResult.to_dict()
+
     # 买入信号
     buy_signal: BuySignal = BuySignal.WAIT
     signal_score: int = 0            # 综合评分 0-100
@@ -205,6 +209,7 @@ class TrendAnalysisResult:
             'rsi_24': self.rsi_24,
             'rsi_status': self.rsi_status.value,
             'rsi_signal': self.rsi_signal,
+            'quant': self.quant,
         }
 
 
@@ -295,6 +300,9 @@ class StockTrendAnalyzer:
 
         # 6. RSI 分析
         self._analyze_rsi(df, result)
+
+        # 6.5 量化辅助指标
+        result.quant = analyze_quant_indicators(df).to_dict()
 
         # 7. 生成买入信号
         self._generate_signal(result)

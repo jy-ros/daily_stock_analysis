@@ -193,6 +193,20 @@
 
 {% endif %}
 
+{% if result.quant is defined and result.quant %}
+### 🧮 {{ labels.quant_heading }}
+
+| {{ labels.quant_kdj_label }} | {{ labels.quant_boll_label }} | {{ labels.quant_atr_label }} |
+|---------|---------|---------|
+| {{ '%.1f' % result.quant.get('kdj_k', 0) }}/{{ '%.1f' % result.quant.get('kdj_d', 0) }}/{{ '%.1f' % result.quant.get('kdj_j', 0) }} {{ result.quant.get('kdj_status', '') }} | {{ '%.0f' % result.quant.get('boll_position', 0) }}/100{{ labels.quant_boll_width_label }} {{ '%.1f' % result.quant.get('boll_width_pct', 0) }}% | {{ '%.1f' % result.quant.get('atr_pct', 0) }}% |
+| {{ labels.quant_vol_label }} | {{ labels.quant_max_drawdown_label }} | {{ labels.quant_var_label }} |
+|---------|---------|---------|
+| {{ '%.1f' % result.quant.get('vol_20d', 0) }}% | {{ '%.1f' % result.quant.get('max_drawdown_60d', 0) }}% | {{ '%.1f' % result.quant.get('var_95_1d', 0) }}% |
+| {{ labels.quant_risk_level_label }} | |
+|---------|---------|
+| {{ result.quant.get('risk_level', '') }} | |
+{% endif %}
+
 {% set signal_attr = dashboard.get('signal_attribution') or {} %}
 {% set signal_attr_weights = signal_attribution_weight_items(signal_attr) %}
 {% if signal_attribution_has_content(signal_attr) %}

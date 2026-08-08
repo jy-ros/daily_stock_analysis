@@ -1393,6 +1393,34 @@ class NotificationService(
                         report_lines.append(f"**{labels.get('macd_composite_score_label', 'MACD 复合评分')}**: {composite_score}/100（{level}）")
                         report_lines.append("")
 
+                # ========== 量化辅助指标 ==========
+                quant = getattr(result, 'quant', None)
+                if quant and isinstance(quant, dict):
+                    report_lines.extend([
+                        f"### 🧮 {labels.get('quant_heading', '量化辅助指标')}",
+                        "",
+                    ])
+                    report_lines.append(
+                        f"| {labels.get('quant_kdj_label', 'KDJ')} | {labels.get('quant_boll_label', 'BOLL 带内位置')} | {labels.get('quant_atr_label', 'ATR 平均日内波幅')} |"
+                    )
+                    report_lines.append("|---------|---------|---------|")
+                    kdj = f"{quant.get('kdj_k', 0):.1f}/{quant.get('kdj_d', 0):.1f}/{quant.get('kdj_j', 0):.1f} {quant.get('kdj_status', '')}"
+                    boll = f"{quant.get('boll_position', 0):.0f}/100 带宽 {quant.get('boll_width_pct', 0):.1f}%"
+                    atr = f"{quant.get('atr_pct', 0):.1f}%"
+                    report_lines.append(f"| {kdj} | {boll} | {atr} |")
+                    report_lines.append(
+                        f"| {labels.get('quant_vol_label', '20日年化波动率')} | {labels.get('quant_max_drawdown_label', '60日最大回撤')} | {labels.get('quant_var_label', '95%单日VaR')} |"
+                    )
+                    report_lines.append("|---------|---------|---------|")
+                    report_lines.append(
+                        f"| {quant.get('vol_20d', 0):.1f}% | {quant.get('max_drawdown_60d', 0):.1f}% | {quant.get('var_95_1d', 0):.1f}% |"
+                    )
+                    report_lines.append(
+                        f"| {labels.get('quant_risk_level_label', '风险等级')} | |"
+                    )
+                    report_lines.append(f"| {quant.get('risk_level', '低')} | |")
+                    report_lines.append("")
+
                 # ========== 作战计划 ==========
                 battle = dashboard.get('battle_plan', {}) if dashboard else {}
                 if battle:

@@ -1667,6 +1667,9 @@ class AnalysisResult:
     macd_is_noisy: bool = False
     macd_composite_score: int = 50
 
+    # ========== 量化辅助指标（Phase 1，运行时注入，供通知/报告渲染）==========
+    quant: Optional[Dict[str, Any]] = None  # KDJ/BOLL/ATR/波动率/最大回撤/VaR 详见 quant_indicators.py
+
     # ========== 基本面上下文（仅运行时，用于通知拼装；不持久化到 to_dict）==========
     fundamental_context: Optional[Dict[str, Any]] = None
 
@@ -1726,6 +1729,7 @@ class AnalysisResult:
             'macd_bar_strength': self.macd_bar_strength,
             'macd_is_noisy': self.macd_is_noisy,
             'macd_composite_score': self.macd_composite_score,
+            'quant': self.quant,
         }
 
     def get_core_conclusion(self) -> str:
@@ -3929,6 +3933,23 @@ class GeminiAnalyzer:
 ### 📊 MACD 指标
 > 数据不足（少于3个交易日），无法进行 MACD 趋势分析。
 """
+
+        # 添加量化辅助指标（Phase 1：KDJ/BOLL/ATR/波动率/回撤/VaR）
+        quant = context.get('trend_analysis', {}).get('quant')
+        if quant and isinstance(quant, dict):
+            prompt += (
+                f"\n### 🧮 量化辅助指标\n"
+                f"- KDJ({_safe_float(quant.get('kdj_k')):.1f}/"
+                f"{_safe_float(quant.get('kdj_d')):.1f}/"
+                f"{_safe_float(quant.get('kdj_j')):.1f}) 状态：{quant.get('kdj_status', '中性')}\n"
+                f"- BOLL 带内位置：{_safe_float(quant.get('boll_position')):.0f}/100"
+                f"（带宽 {_safe_float(quant.get('boll_width_pct')):.1f}%）\n"
+                f"- ATR 平均日内波幅：{_safe_float(quant.get('atr_pct')):.1f}%（占收盘价）\n"
+                f"- 20 日年化波动率：{_safe_float(quant.get('vol_20d')):.1f}%\n"
+                f"- 60 日最大回撤：{_safe_float(quant.get('max_drawdown_60d')):.1f}%\n"
+                f"- 95% 单日 VaR：{_safe_float(quant.get('var_95_1d')):.1f}%\n"
+                f"- 风险等级：{quant.get('risk_level', '低')}"
+            )
 
         # 添加昨日对比数据
         if 'yesterday' in context:
