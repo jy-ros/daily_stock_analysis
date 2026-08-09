@@ -994,6 +994,9 @@ class Config:
     backtest_min_age_days: int = 14
     backtest_engine_version: str = "v1"
     backtest_neutral_band_pct: float = 2.0
+    backtest_commission_rate: float = 0.0003
+    backtest_min_commission: float = 5.0
+    backtest_slippage_pct: float = 0.001
     
     # === 日志配置 ===
     log_dir: str = "./logs"  # 日志文件目录
@@ -1906,6 +1909,24 @@ class Config:
                 os.getenv('BACKTEST_NEUTRAL_BAND_PCT'),
                 2.0,
                 field_name='BACKTEST_NEUTRAL_BAND_PCT',
+                minimum=0.0,
+            ),
+            backtest_commission_rate=parse_env_float(
+                os.getenv('BACKTEST_COMMISSION_RATE'),
+                0.0003,
+                field_name='BACKTEST_COMMISSION_RATE',
+                minimum=0.0,
+            ),
+            backtest_min_commission=parse_env_float(
+                os.getenv('BACKTEST_MIN_COMMISSION'),
+                5.0,
+                field_name='BACKTEST_MIN_COMMISSION',
+                minimum=0.0,
+            ),
+            backtest_slippage_pct=parse_env_float(
+                os.getenv('BACKTEST_SLIPPAGE_PCT'),
+                0.001,
+                field_name='BACKTEST_SLIPPAGE_PCT',
                 minimum=0.0,
             ),
             log_dir=os.getenv('LOG_DIR', './logs'),

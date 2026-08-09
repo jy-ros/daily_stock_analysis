@@ -419,6 +419,18 @@ class BacktestResult(Base):
     simulated_exit_reason = Column(String(24))  # stop_loss/take_profit/window_end/cash/ambiguous_stop_loss
     simulated_return_pct = Column(Float)
 
+    # 基准对比（Phase 2.1）
+    benchmark_code = Column(String(16))  # 基准指数代码（如 000300/SPX/HSI）
+    benchmark_return_pct = Column(Float)  # 基准区间收益率（%）
+    alpha_pct = Column(Float)  # 超额收益 = stock_return - benchmark_return
+
+    # Phase 2.2: 持仓模拟增强
+    simulated_entry_date = Column(Date)  # 模拟入场日期
+    simulated_exit_date = Column(Date)  # 模拟出场日期
+    holding_days = Column(Integer)  # 持仓天数
+    transaction_costs_json = Column(Text)  # JSON: {total_fees, commission, slippage_cost}
+    net_simulated_return_pct = Column(Float)  # 扣费后净收益率（%）
+
     __table_args__ = (
         UniqueConstraint(
             'analysis_history_id',
@@ -463,6 +475,10 @@ class BacktestSummary(Base):
     # 收益
     avg_stock_return_pct = Column(Float)
     avg_simulated_return_pct = Column(Float)
+
+    # Phase 2.2: 持仓模拟增强
+    avg_net_simulated_return_pct = Column(Float)  # 平均净收益率（%）
+    total_transaction_fees = Column(Float)  # 累计手续费
 
     # 目标价触发统计（仅 long 且配置止盈/止损时统计）
     stop_loss_trigger_rate = Column(Float)

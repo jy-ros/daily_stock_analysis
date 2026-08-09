@@ -27,6 +27,7 @@ import numpy as np
 from src.config import get_config
 from src.macd_analyzer import analyze_macd
 from src.quant_indicators import analyze_quant_indicators
+from src.factor_scorer import compute_composite_factor_score, FactorWeights
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +153,10 @@ class TrendAnalysisResult:
     # 量化辅助指标（Phase 1）
     quant: Optional[Dict[str, Any]] = None  # KDJ/BOLL/ATR/波动率/回撤/VaR 见 QuantIndicatorsResult.to_dict()
 
+    # 技术因子复合评分（Phase 3.1）
+    factor_score: float = 50.0     # 量化因子复合评分（0-100）
+    factor_reasons: List[str] = field(default_factory=list)  # 量化因子评分理由
+
     # 买入信号
     buy_signal: BuySignal = BuySignal.WAIT
     signal_score: int = 0            # 综合评分 0-100
@@ -210,6 +215,8 @@ class TrendAnalysisResult:
             'rsi_status': self.rsi_status.value,
             'rsi_signal': self.rsi_signal,
             'quant': self.quant,
+            'factor_score': self.factor_score,
+            'factor_reasons': self.factor_reasons,
         }
 
 
@@ -303,6 +310,13 @@ class StockTrendAnalyzer:
 
         # 6.5 量化辅助指标
         result.quant = analyze_quant_indicators(df).to_dict()
+
+        # 6.6 技术因子复合评分（Phase 3.1）
+        factor_result = compute_composite_factor_score(result.quant)
+        result.factor_score = factor_result.total_score
+        result.factor_reasons = factor_result.reasons
+        if factor_result.risk_warnings:
+            result.risk_factors.extend(factor_result.risk_warnings)
 
         # 7. 生成买入信号
         self._generate_signal(result)

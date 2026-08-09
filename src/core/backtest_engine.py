@@ -40,6 +40,10 @@ class BacktestResultLike(Protocol):
     first_hit: Optional[str]
     first_hit_trading_days: Optional[int]
     operation_advice: Optional[str]
+    # Phase 2.2: portfolio simulation fields
+    net_simulated_return_pct: Optional[float]
+    holding_days: Optional[int]
+    transaction_costs: Optional[Dict[str, float]]
 
 
 @dataclass(frozen=True)
@@ -47,6 +51,37 @@ class EvaluationConfig:
     eval_window_days: int
     neutral_band_pct: float = 2.0
     engine_version: str = "v1"
+
+
+@dataclass(frozen=True)
+class TransactionCostConfig:
+    """Per-trade transaction cost parameters for simulated positions.
+
+    Attributes:
+        commission_rate: Proportional commission rate (e.g. 0.0003 = 0.03%).
+        min_commission: Minimum absolute commission per trade (e.g. 5.0 CNY).
+        slippage_pct: Slippage as a percentage of execution price (e.g. 0.001 = 0.1%).
+    """
+
+    commission_rate: float = 0.0003
+    min_commission: float = 5.0
+    slippage_pct: float = 0.001
+
+
+@dataclass(frozen=True)
+class PortfolioMetrics:
+    """Portfolio-level aggregated metrics from a series of backtest results."""
+
+    total_trades: int = 0
+    cumulative_net_return_pct: Optional[float] = None
+    avg_net_return_pct: Optional[float] = None
+    max_drawdown_pct: Optional[float] = None
+    sharpe_ratio: Optional[float] = None
+    total_fees: Optional[float] = None
+    avg_holding_days: Optional[float] = None
+    net_win_count: int = 0
+    net_loss_count: int = 0
+    net_win_rate_pct: Optional[float] = None
 
 
 class BacktestEngine:
@@ -154,6 +189,38 @@ class BacktestEngine:
             return "cash"
         return "cash"
 
+    @staticmethod
+    def _compute_fees_and_slippage(
+        *,
+        entry_price: float,
+        exit_price: float,
+        cost_config: Optional[TransactionCostConfig],
+    ) -> Dict[str, Any]:
+        """Compute total transaction costs (commission + slippage) for a round-trip trade.
+
+        Returns dict with total_fees, commission, slippage_cost.
+        If cost_config is None or prices are non-positive, all values are 0.
+        """
+        if cost_config is None or entry_price <= 0 or exit_price <= 0:
+            return {"total_fees": 0.0, "commission": 0.0, "slippage_cost": 0.0}
+
+        # Commission: max(proportional, min) applied to entry + exit
+        entry_commission = max(entry_price * cost_config.commission_rate, cost_config.min_commission)
+        exit_commission = max(exit_price * cost_config.commission_rate, cost_config.min_commission)
+        total_commission = entry_commission + exit_commission
+
+        # Slippage: percentage applied to entry (worse) and exit (worse)
+        slippage_entry = entry_price * cost_config.slippage_pct
+        slippage_exit = exit_price * cost_config.slippage_pct
+        total_slippage = slippage_entry + slippage_exit
+
+        total_fees = total_commission + total_slippage
+        return {
+            "total_fees": round(total_fees, 4),
+            "commission": round(total_commission, 4),
+            "slippage_cost": round(total_slippage, 4),
+        }
+
     @classmethod
     def evaluate_single(
         cls,
@@ -165,6 +232,7 @@ class BacktestEngine:
         stop_loss: Optional[float],
         take_profit: Optional[float],
         config: EvaluationConfig,
+        cost_config: Optional[TransactionCostConfig] = None,
     ) -> Dict[str, Any]:
         """Evaluate one historical analysis against forward daily bars.
 
@@ -244,6 +312,32 @@ class BacktestEngine:
         else:
             simulated_return_pct = (simulated_exit_price - start_price) / start_price * 100
 
+        # Phase 2.2: Transaction costs and multi-day position tracking
+        simulated_entry_date: Optional[date] = analysis_date if position == "long" else None
+        simulated_exit_date: Optional[date] = None
+        holding_days: Optional[int] = None
+        transaction_costs: Optional[Dict[str, float]] = None
+        net_simulated_return_pct: Optional[float] = None
+
+        if position == "long" and simulated_exit_price is not None:
+            # Exit date: if stop/tp hit, use first_hit_date; otherwise window end
+            if first_hit_date is not None and first_hit in ("stop_loss", "take_profit", "ambiguous"):
+                simulated_exit_date = first_hit_date
+                holding_days = first_hit_days
+            else:
+                simulated_exit_date = window_bars[-1].date if window_bars else None
+                holding_days = eval_days
+
+            fee_result = cls._compute_fees_and_slippage(
+                entry_price=start_price,
+                exit_price=simulated_exit_price,
+                cost_config=cost_config,
+            )
+            transaction_costs = fee_result
+            # Net return = gross return - (total_fees / entry_price * 100)
+            fee_pct = fee_result["total_fees"] / start_price * 100 if start_price > 0 else 0.0
+            net_simulated_return_pct = round(simulated_return_pct - fee_pct, 4) if simulated_return_pct is not None else None
+
         return {
             "analysis_date": analysis_date,
             "eval_window_days": eval_days,
@@ -270,6 +364,65 @@ class BacktestEngine:
             "simulated_exit_price": simulated_exit_price,
             "simulated_exit_reason": simulated_exit_reason,
             "simulated_return_pct": simulated_return_pct,
+            # Phase 2.2: 手续费/滑点 + 多日持仓
+            "simulated_entry_date": simulated_entry_date,
+            "simulated_exit_date": simulated_exit_date,
+            "holding_days": holding_days,
+            "transaction_costs": transaction_costs,
+            "net_simulated_return_pct": net_simulated_return_pct,
+        }
+
+    @classmethod
+    def evaluate_benchmark(
+        cls,
+        *,
+        stock_return_pct: Optional[float],
+        benchmark_closes: Sequence[Optional[float]],
+        eval_window_days: int,
+    ) -> Dict[str, Any]:
+        """纯逻辑：从基准指数收盘价序列计算 benchmark_return_pct 和 alpha。
+
+        Args:
+            stock_return_pct: 个股区间收益率（%），可为 None
+            benchmark_closes: 基准指数按日期排序的收盘价列表
+            eval_window_days: 评估窗口天数
+
+        Returns:
+            dict with benchmark_code_result / benchmark_return_pct / alpha_pct
+        """
+        if not benchmark_closes or len(benchmark_closes) < 2:
+            return {"benchmark_return_pct": None, "alpha_pct": None}
+
+        end_idx = min(eval_window_days, len(benchmark_closes) - 1)
+        if end_idx <= 0:
+            return {"benchmark_return_pct": None, "alpha_pct": None}
+        start_price = benchmark_closes[0]
+        end_price = benchmark_closes[end_idx]
+
+        if start_price is None or end_price is None:
+            return {"benchmark_return_pct": None, "alpha_pct": None}
+
+        try:
+            start_val = float(start_price)
+            end_val = float(end_price)
+        except (TypeError, ValueError):
+            return {"benchmark_return_pct": None, "alpha_pct": None}
+
+        if start_val <= 0:
+            return {"benchmark_return_pct": None, "alpha_pct": None}
+
+        benchmark_return_pct = round((end_val - start_val) / start_val * 100, 4)
+
+        alpha_pct: Optional[float] = None
+        if stock_return_pct is not None:
+            try:
+                alpha_pct = round(float(stock_return_pct) - benchmark_return_pct, 4)
+            except (TypeError, ValueError):
+                alpha_pct = None
+
+        return {
+            "benchmark_return_pct": benchmark_return_pct,
+            "alpha_pct": alpha_pct,
         }
 
     @classmethod
@@ -400,6 +553,22 @@ class BacktestEngine:
         avg_stock_return_pct = cls._average([r.stock_return_pct for r in completed])
         avg_simulated_return_pct = cls._average([r.simulated_return_pct for r in completed])
 
+        # Phase 2.2: net return and fee aggregation
+        long_completed_with_net = [
+            r for r in completed
+            if (r.position_recommendation or "") == "long"
+            and getattr(r, "net_simulated_return_pct", None) is not None
+        ]
+        avg_net_simulated_return_pct = cls._average(
+            [getattr(r, "net_simulated_return_pct", None) for r in long_completed_with_net]
+        ) if long_completed_with_net else None
+        total_fees_list = [
+            float(getattr(r, "transaction_costs", {}).get("total_fees", 0) or 0)
+            for r in long_completed_with_net
+            if isinstance(getattr(r, "transaction_costs", None), dict)
+        ]
+        total_transaction_fees = round(sum(total_fees_list), 4) if total_fees_list else None
+
         stop_applicable = [
             r
             for r in completed
@@ -470,6 +639,8 @@ class BacktestEngine:
             "neutral_rate_pct": neutral_rate_pct,
             "avg_stock_return_pct": avg_stock_return_pct,
             "avg_simulated_return_pct": avg_simulated_return_pct,
+            "avg_net_simulated_return_pct": avg_net_simulated_return_pct,
+            "total_transaction_fees": total_transaction_fees,
             "stop_loss_trigger_rate": stop_loss_trigger_rate,
             "take_profit_trigger_rate": take_profit_trigger_rate,
             "ambiguous_rate": ambiguous_rate,
@@ -477,6 +648,97 @@ class BacktestEngine:
             "advice_breakdown": advice_breakdown,
             "diagnostics": diagnostics,
         }
+
+    @classmethod
+    def compute_portfolio_metrics(
+        cls,
+        *,
+        results: Sequence[BacktestResultLike],
+    ) -> PortfolioMetrics:
+        """Aggregate completed long trades into portfolio-level metrics.
+
+        Computes cumulative net return, max drawdown, Sharpe ratio, and
+        win/loss statistics from individual backtest results.
+        """
+        # Filter to completed long trades with net return data
+        long_completed = [
+            r
+            for r in results
+            if (r.eval_status or "") == "completed"
+            and (r.position_recommendation or "") == "long"
+            and getattr(r, "net_simulated_return_pct", None) is not None
+        ]
+
+        if not long_completed:
+            return PortfolioMetrics()
+
+        net_returns = [float(getattr(r, "net_simulated_return_pct", 0) or 0) for r in long_completed]
+        gross_returns = [float(getattr(r, "simulated_return_pct", 0) or 0) for r in long_completed]
+        holding_days_list = [
+            float(getattr(r, "holding_days", 0) or 0)
+            for r in long_completed
+            if getattr(r, "holding_days", None) is not None
+        ]
+        total_fees_list = [
+            float(getattr(r, "transaction_costs", {}).get("total_fees", 0) or 0)
+            for r in long_completed
+            if isinstance(getattr(r, "transaction_costs", None), dict)
+        ]
+
+        # Cumulative net return: product of (1 + r/100) - 1
+        cumulative = 1.0
+        for r in net_returns:
+            cumulative *= 1.0 + r / 100.0
+        cumulative_net_return_pct = round((cumulative - 1.0) * 100, 4)
+
+        avg_net_return_pct = round(sum(net_returns) / len(net_returns), 4) if net_returns else None
+
+        # Max drawdown from cumulative equity curve
+        equity = [100.0]
+        for r in net_returns:
+            equity.append(equity[-1] * (1.0 + r / 100.0))
+        peak = equity[0]
+        max_dd = 0.0
+        for val in equity:
+            if val > peak:
+                peak = val
+            dd = (peak - val) / peak * 100 if peak > 0 else 0.0
+            if dd > max_dd:
+                max_dd = dd
+        max_drawdown_pct = round(max_dd, 4)
+
+        # Sharpe ratio (annualized, risk-free=0, assuming ~252 trading days/year)
+        sharpe_ratio: Optional[float] = None
+        if len(net_returns) > 1:
+            mean_r = sum(net_returns) / len(net_returns)
+            variance = sum((r - mean_r) ** 2 for r in net_returns) / (len(net_returns) - 1)
+            std_r = variance ** 0.5
+            if std_r > 0:
+                # Approximate annualization: assume avg holding period
+                avg_hold = sum(holding_days_list) / len(holding_days_list) if holding_days_list else 10.0
+                periods_per_year = 252.0 / max(avg_hold, 1.0)
+                sharpe_ratio = round(mean_r / std_r * (periods_per_year ** 0.5), 4)
+
+        total_fees = round(sum(total_fees_list), 4) if total_fees_list else None
+        avg_holding = round(sum(holding_days_list) / len(holding_days_list), 2) if holding_days_list else None
+
+        # Win/loss by net return
+        net_win = sum(1 for r in net_returns if r > 0)
+        net_loss = sum(1 for r in net_returns if r < 0)
+        net_win_rate = round(net_win / (net_win + net_loss) * 100, 2) if (net_win + net_loss) > 0 else None
+
+        return PortfolioMetrics(
+            total_trades=len(long_completed),
+            cumulative_net_return_pct=cumulative_net_return_pct,
+            avg_net_return_pct=avg_net_return_pct,
+            max_drawdown_pct=max_drawdown_pct,
+            sharpe_ratio=sharpe_ratio,
+            total_fees=total_fees,
+            avg_holding_days=avg_holding,
+            net_win_count=net_win,
+            net_loss_count=net_loss,
+            net_win_rate_pct=net_win_rate,
+        )
 
     @staticmethod
     def _normalize_text(value: Optional[str]) -> str:

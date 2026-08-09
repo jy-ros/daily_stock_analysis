@@ -205,6 +205,9 @@
 | {{ labels.quant_risk_level_label }} | |
 |---------|---------|
 | {{ result.quant.get('risk_level', '') }} | |
+{% if result.quant.get('analysis') %}
+*{{ result.quant['analysis'] }}*
+{% endif %}
 {% endif %}
 
 {% set signal_attr = dashboard.get('signal_attribution') or {} %}

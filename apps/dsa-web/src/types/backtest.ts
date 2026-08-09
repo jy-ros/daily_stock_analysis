@@ -69,6 +69,18 @@ export interface BacktestResultItem {
   simulatedExitPrice?: number;
   simulatedExitReason?: string;
   simulatedReturnPct?: number;
+
+  // Phase 2.1: 基准对比
+  benchmarkCode?: string;
+  benchmarkReturnPct?: number;
+  alphaPct?: number;
+
+  // Phase 2.2: 持仓模拟增强
+  simulatedEntryDate?: string;
+  simulatedExitDate?: string;
+  holdingDays?: number;
+  transactionCosts?: { totalFees: number; commission: number; slippageCost: number };
+  netSimulatedReturnPct?: number;
 }
 
 export interface BacktestResultsResponse {
@@ -109,4 +121,12 @@ export interface PerformanceMetrics {
 
   adviceBreakdown: Record<string, unknown>;
   diagnostics: Record<string, unknown>;
+
+  // Phase 2.1: 基准对比聚合
+  avgAlphaPct?: number;
+  alphaPositiveRate?: number;
+
+  // Phase 2.2: 持仓模拟增强
+  avgNetSimulatedReturnPct?: number;
+  totalTransactionFees?: number;
 }

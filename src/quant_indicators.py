@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
@@ -84,6 +84,7 @@ class QuantIndicatorsResult:
 
     # 汇总
     summary: str = ""  # 一句话量化视角描述
+    analysis: str = ""  # 量化指标综合分析总结（供报告渲染）
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -105,6 +106,7 @@ class QuantIndicatorsResult:
             "var_95_1d": self.var_95_1d,
             "risk_level": self.risk_level,
             "summary": self.summary,
+            "analysis": self.analysis,
         }
 
 
@@ -273,6 +275,69 @@ def build_quant_summary(quant: Dict[str, Any]) -> str:
     )
 
 
+def build_quant_analysis(quant: Dict[str, Any]) -> str:
+    """基于指标组合生成量化分析总结（供报告渲染，非原始数据罗列）。"""
+    parts: List[str] = []
+
+    # --- KDJ ---
+    kdj_status = quant.get("kdj_status", "中性")
+    kdj_k = _to_float(quant.get("kdj_k"))
+    kdj_j = _to_float(quant.get("kdj_j"))
+    if kdj_status == "超买":
+        parts.append(f"KDJ 指标进入超买区（K={kdj_k:.1f}，J={kdj_j:.1f}），短期回调风险加大")
+    elif kdj_status == "超卖":
+        parts.append(f"KDJ 指标进入超卖区（K={kdj_k:.1f}，J={kdj_j:.1f}），短期可能存在反弹机会")
+    elif kdj_status == "金叉":
+        parts.append("KDJ 出现金叉，短期偏多信号")
+    elif kdj_status == "死叉":
+        parts.append("KDJ 出现死叉，短期偏空信号")
+    elif kdj_status == "多头":
+        parts.append("KDJ 多头排列，短期趋势偏多")
+    elif kdj_status == "空头":
+        parts.append("KDJ 空头排列，短期趋势偏空")
+
+    # --- BOLL ---
+    boll_pos = _to_float(quant.get("boll_position"))
+    boll_width = _to_float(quant.get("boll_width_pct"))
+    if boll_pos >= 80:
+        parts.append(f"当前价位于布林带上轨附近（{boll_pos:.0f}/100），处于超买区间")
+    elif boll_pos <= 20:
+        parts.append(f"当前价位于布林带下轨附近（{boll_pos:.0f}/100），处于超卖区间")
+    if boll_width >= 40:
+        parts.append(f"布林带带宽 {boll_width:.1f}%，波动剧烈，行情可能进入高震荡阶段")
+    elif 0 < boll_width < 10:
+        parts.append(f"布林带带宽仅 {boll_width:.1f}%，波动收敛，关注变盘方向")
+
+    # --- ATR ---
+    atr_pct = _to_float(quant.get("atr_pct"))
+    if atr_pct >= 5:
+        parts.append(f"ATR 日均波幅 {atr_pct:.1f}%，日内波动较大，操作需注意节奏")
+
+    # --- 波动率 + 风险等级 ---
+    vol_20d = _to_float(quant.get("vol_20d"))
+    risk_level = quant.get("risk_level", "低")
+    if risk_level == "高":
+        parts.append(f"20日年化波动率 {vol_20d:.1f}%，属于高波动品种，风险等级为「高」")
+    elif risk_level == "中":
+        parts.append(f"20日年化波动率 {vol_20d:.1f}%，波动适中，风险等级为「中」")
+
+    # --- 最大回撤 ---
+    max_dd = _to_float(quant.get("max_drawdown_60d"))
+    if max_dd >= 20:
+        parts.append(f"60日最大回撤 {max_dd:.1f}%，近期回撤幅度较大，持仓风险较高")
+    elif max_dd >= 10:
+        parts.append(f"60日最大回撤 {max_dd:.1f}%，存在一定回调幅度")
+
+    # --- VaR ---
+    var_95 = _to_float(quant.get("var_95_1d"))
+    if var_95 >= 3:
+        parts.append(f"95%单日VaR为 {var_95:.1f}%，意味着绝大多数交易日单日亏损不超过{var_95:.1f}%")
+
+    if not parts:
+        return "量化指标整体偏中性，无明显超买超卖信号"
+    return "；".join(parts) + "。"
+
+
 def analyze_quant_indicators(df: Optional[pd.DataFrame]) -> QuantIndicatorsResult:
     """计算量化辅助指标；数据不足 / 异常时优雅降级，不抛异常。"""
     result = QuantIndicatorsResult()
@@ -308,8 +373,10 @@ def analyze_quant_indicators(df: Optional[pd.DataFrame]) -> QuantIndicatorsResul
         result.risk_level = _risk_level(result.vol_20d)
 
         result.summary = build_quant_summary(result.to_dict())
+        result.analysis = build_quant_analysis(result.to_dict())
         return result
     except Exception as e:
         logger.warning("[quant] analyze_quant_indicators degraded: %s", e)
         result.summary = "量化指标计算降级，本次不可用"
+        result.analysis = ""
         return result

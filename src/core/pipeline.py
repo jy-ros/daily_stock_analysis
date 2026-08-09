@@ -767,6 +767,8 @@ class StockAnalysisPipeline:
                     result.macd_is_noisy = trend_result.macd_is_noisy
                     result.macd_composite_score = trend_result.macd_composite_score
                     result.quant = trend_result.quant
+                    result.factor_score = trend_result.factor_score
+                    result.factor_reasons = trend_result.factor_reasons
                 adjustments = apply_phase_decision_guardrails(
                     result,
                     market_phase_summary=market_phase_summary,
@@ -1447,6 +1449,8 @@ class StockAnalysisPipeline:
                     result.macd_is_noisy = trend_result.macd_is_noisy
                     result.macd_composite_score = trend_result.macd_composite_score
                     result.quant = trend_result.quant
+                    result.factor_score = trend_result.factor_score
+                    result.factor_reasons = trend_result.factor_reasons
                 adjustments = apply_phase_decision_guardrails(
                     result,
                     market_phase_summary=market_phase_summary,

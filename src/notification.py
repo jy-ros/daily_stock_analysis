@@ -1419,6 +1419,9 @@ class NotificationService(
                         f"| {labels.get('quant_risk_level_label', '风险等级')} | |"
                     )
                     report_lines.append(f"| {quant.get('risk_level', '低')} | |")
+                    quant_analysis = quant.get('analysis', '')
+                    if quant_analysis:
+                        report_lines.append(f"*{quant_analysis}*")
                     report_lines.append("")
 
                 # ========== 作战计划 ==========

@@ -1670,6 +1670,10 @@ class AnalysisResult:
     # ========== 量化辅助指标（Phase 1，运行时注入，供通知/报告渲染）==========
     quant: Optional[Dict[str, Any]] = None  # KDJ/BOLL/ATR/波动率/最大回撤/VaR 详见 quant_indicators.py
 
+    # ========== 技术因子复合评分（Phase 3.1）==========
+    factor_score: float = 50.0     # 量化因子复合评分（0-100）
+    factor_reasons: Optional[List[str]] = None  # 量化因子评分理由
+
     # ========== 基本面上下文（仅运行时，用于通知拼装；不持久化到 to_dict）==========
     fundamental_context: Optional[Dict[str, Any]] = None
 
@@ -1730,6 +1734,8 @@ class AnalysisResult:
             'macd_is_noisy': self.macd_is_noisy,
             'macd_composite_score': self.macd_composite_score,
             'quant': self.quant,
+            'factor_score': self.factor_score,
+            'factor_reasons': self.factor_reasons,
         }
 
     def get_core_conclusion(self) -> str:

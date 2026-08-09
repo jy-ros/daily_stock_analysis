@@ -74,6 +74,18 @@ class BacktestResultItem(BaseModel):
     simulated_exit_reason: Optional[str] = None
     simulated_return_pct: Optional[float] = None
 
+    # Phase 2.1: 基准对比
+    benchmark_code: Optional[str] = Field(None, description="基准指数代码")
+    benchmark_return_pct: Optional[float] = Field(None, description="基准区间收益率(%)")
+    alpha_pct: Optional[float] = Field(None, description="超额收益 = 个股收益 - 基准收益")
+
+    # Phase 2.2: 持仓模拟增强
+    simulated_entry_date: Optional[str] = Field(None, description="模拟入场日期")
+    simulated_exit_date: Optional[str] = Field(None, description="模拟出场日期")
+    holding_days: Optional[int] = Field(None, description="持仓天数")
+    transaction_costs: Optional[Dict[str, float]] = Field(None, description="交易费用明细 {total_fees, commission, slippage_cost}")
+    net_simulated_return_pct: Optional[float] = Field(None, description="扣费后净收益率(%)")
+
 
 class BacktestResultsResponse(BaseModel):
     total: int
@@ -111,3 +123,11 @@ class PerformanceMetrics(BaseModel):
 
     advice_breakdown: Dict[str, Any] = Field(default_factory=dict)
     diagnostics: Dict[str, Any] = Field(default_factory=dict)
+
+    # Phase 2.1: 基准对比聚合
+    avg_alpha_pct: Optional[float] = Field(None, description="平均超额收益(%)")
+    alpha_positive_rate: Optional[float] = Field(None, description="正超额收益占比(%)")
+
+    # Phase 2.2: 持仓模拟增强
+    avg_net_simulated_return_pct: Optional[float] = Field(None, description="平均净收益率(%)")
+    total_transaction_fees: Optional[float] = Field(None, description="累计手续费")

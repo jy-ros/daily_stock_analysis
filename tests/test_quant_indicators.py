@@ -52,7 +52,7 @@ class TestQuantIndicatorsResultToDict(unittest.TestCase):
             "boll_upper", "boll_mid", "boll_lower", "boll_position", "boll_width_pct",
             "atr", "atr_pct",
             "vol_20d", "max_drawdown_60d", "var_95_1d", "risk_level",
-            "summary",
+            "summary", "analysis",
         }
         self.assertEqual(expected_keys, set(d.keys()))
 

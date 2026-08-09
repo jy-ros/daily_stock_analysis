@@ -12,7 +12,14 @@ from sqlalchemy import and_, select
 
 from data_provider.base import canonical_stock_code, normalize_stock_code
 from src.config import get_config
-from src.core.backtest_engine import OVERALL_SENTINEL_CODE, BacktestEngine, EvaluationConfig
+from src.core.backtest_engine import (
+    OVERALL_SENTINEL_CODE,
+    BacktestEngine,
+    EvaluationConfig,
+    PortfolioMetrics,
+    TransactionCostConfig,
+)
+from src.benchmark import get_benchmark_code_for_stock, compute_benchmark_return_pct, compute_alpha
 from src.market_phase_summary import extract_market_phase_summary, normalize_analysis_phase_bucket
 from src.repositories.backtest_repo import BacktestRepository
 from src.repositories.stock_repo import StockRepository
@@ -65,6 +72,13 @@ class BacktestService:
             eval_window_days=int(eval_window_days),
             neutral_band_pct=neutral_band_pct,
             engine_version=str(engine_version),
+        )
+
+        # Phase 2.2: 交易成本配置
+        cost_config = TransactionCostConfig(
+            commission_rate=float(config.backtest_commission_rate),
+            min_commission=float(config.backtest_min_commission),
+            slippage_pct=float(config.backtest_slippage_pct),
         )
 
         limit_int = int(limit)
@@ -180,7 +194,39 @@ class BacktestService:
                     stop_loss=analysis.stop_loss,
                     take_profit=analysis.take_profit,
                     config=eval_config,
+                    cost_config=cost_config,
                 )
+
+                # Phase 2.1: 基准对比
+                benchmark_code = None
+                benchmark_return_pct = None
+                alpha_pct = None
+                if evaluation.get("eval_status") == "completed":
+                    try:
+                        from src.core.trading_calendar import get_market_for_stock
+                        from data_provider.base import DataFetcherManager
+
+                        market = get_market_for_stock(analysis.code) or "cn"
+                        benchmark_code = get_benchmark_code_for_stock(analysis.code, market)
+                        _bm_start = start_daily.date
+                        _bm_end = (_bm_start + timedelta(days=int(eval_window_days) * 2 + 10))
+                        _bm_df, _bm_src = DataFetcherManager().get_daily_data(
+                            stock_code=benchmark_code,
+                            start_date=_bm_start.strftime("%Y-%m-%d"),
+                            end_date=_bm_end.strftime("%Y-%m-%d"),
+                            days=int(eval_window_days) + 15,
+                        )
+                        if _bm_df is not None and not _bm_df.empty and len(_bm_df) >= 2:
+                            bm_closes = _bm_df["close"].tolist()
+                            bm_result = BacktestEngine.evaluate_benchmark(
+                                stock_return_pct=evaluation.get("stock_return_pct"),
+                                benchmark_closes=bm_closes,
+                                eval_window_days=int(eval_window_days),
+                            )
+                            benchmark_return_pct = bm_result.get("benchmark_return_pct")
+                            alpha_pct = bm_result.get("alpha_pct")
+                    except Exception as bm_exc:
+                        logger.debug("[benchmark] skip for %s: %s", analysis.code, bm_exc)
 
                 status = evaluation.get("eval_status")
                 if status == "insufficient_data":
@@ -220,6 +266,18 @@ class BacktestService:
                         simulated_exit_price=evaluation.get("simulated_exit_price"),
                         simulated_exit_reason=evaluation.get("simulated_exit_reason"),
                         simulated_return_pct=evaluation.get("simulated_return_pct"),
+                        # Phase 2.1: 基准对比
+                        benchmark_code=benchmark_code,
+                        benchmark_return_pct=benchmark_return_pct,
+                        alpha_pct=alpha_pct,
+                        # Phase 2.2: 持仓模拟增强
+                        simulated_entry_date=evaluation.get("simulated_entry_date"),
+                        simulated_exit_date=evaluation.get("simulated_exit_date"),
+                        holding_days=evaluation.get("holding_days"),
+                        transaction_costs_json=json.dumps(
+                            evaluation.get("transaction_costs"), ensure_ascii=False
+                        ) if evaluation.get("transaction_costs") else None,
+                        net_simulated_return_pct=evaluation.get("net_simulated_return_pct"),
                     )
                 )
 
@@ -993,6 +1051,8 @@ class BacktestService:
             neutral_rate_pct=summary_data.get("neutral_rate_pct"),
             avg_stock_return_pct=summary_data.get("avg_stock_return_pct"),
             avg_simulated_return_pct=summary_data.get("avg_simulated_return_pct"),
+            avg_net_simulated_return_pct=summary_data.get("avg_net_simulated_return_pct"),
+            total_transaction_fees=summary_data.get("total_transaction_fees"),
             stop_loss_trigger_rate=summary_data.get("stop_loss_trigger_rate"),
             take_profit_trigger_rate=summary_data.get("take_profit_trigger_rate"),
             ambiguous_rate=summary_data.get("ambiguous_rate"),
@@ -1056,6 +1116,12 @@ class BacktestService:
             "simulated_exit_price": row.simulated_exit_price,
             "simulated_exit_reason": row.simulated_exit_reason,
             "simulated_return_pct": row.simulated_return_pct,
+            # Phase 2.2: 持仓模拟增强
+            "simulated_entry_date": row.simulated_entry_date.isoformat() if row.simulated_entry_date else None,
+            "simulated_exit_date": row.simulated_exit_date.isoformat() if row.simulated_exit_date else None,
+            "holding_days": row.holding_days,
+            "transaction_costs": parse_json_field(row.transaction_costs_json),
+            "net_simulated_return_pct": row.net_simulated_return_pct,
         }
 
     @staticmethod
@@ -1079,6 +1145,8 @@ class BacktestService:
             "neutral_rate_pct": row.neutral_rate_pct,
             "avg_stock_return_pct": row.avg_stock_return_pct,
             "avg_simulated_return_pct": row.avg_simulated_return_pct,
+            "avg_net_simulated_return_pct": row.avg_net_simulated_return_pct,
+            "total_transaction_fees": row.total_transaction_fees,
             "stop_loss_trigger_rate": row.stop_loss_trigger_rate,
             "take_profit_trigger_rate": row.take_profit_trigger_rate,
             "ambiguous_rate": row.ambiguous_rate,
@@ -1100,7 +1168,9 @@ class BacktestService:
             default=0.5,
         )
 
-        avg_return_pct = summary.get("avg_simulated_return_pct")
+        avg_return_pct = summary.get("avg_net_simulated_return_pct")
+        if avg_return_pct is None:
+            avg_return_pct = summary.get("avg_simulated_return_pct")
         if avg_return_pct is None:
             avg_return_pct = summary.get("avg_stock_return_pct")
         normalized["avg_return"] = BacktestService._pct_to_ratio(avg_return_pct, default=0.0)

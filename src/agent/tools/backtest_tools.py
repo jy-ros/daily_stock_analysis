@@ -41,6 +41,8 @@ def _serialize_overall_backtest_summary(summary: dict, eval_window_days: int) ->
         "direction_accuracy_pct": summary.get("direction_accuracy_pct"),
         "avg_stock_return_pct": summary.get("avg_stock_return_pct"),
         "avg_simulated_return_pct": summary.get("avg_simulated_return_pct"),
+        "avg_net_simulated_return_pct": summary.get("avg_net_simulated_return_pct"),
+        "total_transaction_fees": summary.get("total_transaction_fees"),
         "stop_loss_trigger_rate": summary.get("stop_loss_trigger_rate"),
         "take_profit_trigger_rate": summary.get("take_profit_trigger_rate"),
         "advice_breakdown": summary.get("advice_breakdown"),
@@ -169,6 +171,8 @@ def _handle_get_stock_backtest_summary(stock_code: str, eval_window_days: int = 
                 "direction_accuracy_pct": summary.get("direction_accuracy_pct"),
                 "avg_stock_return_pct": summary.get("avg_stock_return_pct"),
                 "avg_simulated_return_pct": summary.get("avg_simulated_return_pct"),
+                "avg_net_simulated_return_pct": summary.get("avg_net_simulated_return_pct"),
+                "total_transaction_fees": summary.get("total_transaction_fees"),
                 "computed_at": summary.get("computed_at"),
             }
         else:
@@ -186,6 +190,8 @@ def _handle_get_stock_backtest_summary(stock_code: str, eval_window_days: int = 
                 "direction_correct": item.get("direction_correct"),
                 "outcome": item.get("outcome"),
                 "simulated_return_pct": item.get("simulated_return_pct"),
+                "net_simulated_return_pct": item.get("net_simulated_return_pct"),
+                "holding_days": item.get("holding_days"),
                 "hit_stop_loss": item.get("hit_stop_loss"),
                 "hit_take_profit": item.get("hit_take_profit"),
             }
