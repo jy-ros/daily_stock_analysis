@@ -513,6 +513,100 @@ jobs:
             reports/
             logs/
           retention-days: 30
+
+      - name: 发送报告邮件（内嵌 HTML）
+        if: always() && env.EMAIL_SENDER != '' && env.EMAIL_PASSWORD != '' && env.EMAIL_RECEIVERS != ''
+        env:
+          EMAIL_SENDER: ${{ vars.EMAIL_SENDER || secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_RECEIVERS: ${{ vars.EMAIL_RECEIVERS || secrets.EMAIL_RECEIVERS }}
+          EMAIL_SENDER_NAME: ${{ vars.EMAIL_SENDER_NAME || secrets.EMAIL_SENDER_NAME || 'DSA 股票分析' }}
+        run: |
+          python3 - <<'PYEOF'
+          import os, glob, smtplib, ssl
+          from email.mime.multipart import MIMEMultipart
+          from email.mime.text import MIMEText
+          from datetime import date
+
+          sender = os.environ.get("EMAIL_SENDER", "")
+          password = os.environ.get("EMAIL_PASSWORD", "")
+          receivers_raw = os.environ.get("EMAIL_RECEIVERS", "")
+          sender_name = os.environ.get("EMAIL_SENDER_NAME", "DSA")
+
+          if not all([sender, password, receivers_raw]):
+              print("⚠️ 邮件配置不完整，跳过发送")
+              exit(0)
+
+          receivers = [r.strip() for r in receivers_raw.split(",") if r.strip()]
+          if not receivers:
+              print("⚠️ 无收件人，跳过发送")
+              exit(0)
+
+          # Find latest report markdown
+          report_files = sorted(glob.glob("reports/report_*.md"))
+          if not report_files:
+              print("⚠️ 未找到报告文件，跳过发送")
+              exit(0)
+
+          latest = report_files[-1]
+          with open(latest, "r", encoding="utf-8") as f:
+              md_content = f.read()
+
+          # Convert markdown to styled HTML (reuse project's formatter)
+          try:
+              import sys
+              sys.path.insert(0, "src")
+              from formatters import markdown_to_html_document
+              html_body = markdown_to_html_document(md_content)
+          except ImportError:
+              # Fallback: basic markdown conversion
+              import markdown2
+              html_body = f"""<!DOCTYPE html>
+          <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+          <style>body{{font-family:-apple-system,sans-serif;max-width:800px;margin:0 auto;padding:16px;line-height:1.6;color:#333}}
+          table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #ddd;padding:8px;text-align:left}}
+          th{{background:#f5f5f5}}</style></head><body>
+          {markdown2.markdown(md_content, extras=["tables","fenced-code-blocks"])}
+          </body></html>"""
+
+          today = date.today().isoformat()
+          subject = f"📊 股票分析报告 {today}"
+
+          # Build multipart/alternative email (inline HTML + plain text fallback)
+          msg = MIMEMultipart("alternative")
+          msg["Subject"] = subject
+          msg["From"] = f"{sender_name} <{sender}>"
+          msg["To"] = ", ".join(receivers)
+
+          msg.attach(MIMEText(md_content, "plain", "utf-8"))
+          msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+          # Auto-detect SMTP server from domain
+          domain = sender.split("@")[-1].lower()
+          smtp_map = {
+              "qq.com": ("smtp.qq.com", 465), "163.com": ("smtp.163.com", 465),
+              "126.com": ("smtp.126.com", 465), "gmail.com": ("smtp.gmail.com", 587),
+              "outlook.com": ("smtp.office365.com", 587), "hotmail.com": ("smtp.office365.com", 587),
+              "live.com": ("smtp.office365.com", 587), "sina.com": ("smtp.sina.com", 465),
+              "aliyun.com": ("smtp.aliyun.com", 465),
+          }
+          host, port = smtp_map.get(domain, (f"smtp.{domain}", 465))
+
+          try:
+              context = ssl.create_default_context()
+              if port == 587:
+                  with smtplib.SMTP(host, port, timeout=30) as server:
+                      server.starttls(context=context)
+                      server.login(sender, password)
+                      server.sendmail(sender, receivers, msg.as_string())
+              else:
+                  with smtplib.SMTP_SSL(host, port, timeout=30, context=context) as server:
+                      server.login(sender, password)
+                      server.sendmail(sender, receivers, msg.as_string())
+              print(f"✅ 报告邮件已发送至: {', '.join(receivers)}")
+          except Exception as e:
+              print(f"⚠️ 邮件发送失败: {e}")
+          PYEOF
       
       - name: 显示运行结果
         if: always()

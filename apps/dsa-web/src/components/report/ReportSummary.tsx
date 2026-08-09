@@ -5,6 +5,7 @@ import { ReportStrategy } from './ReportStrategy';
 import { ReportNews } from './ReportNews';
 import { ReportDetails } from './ReportDetails';
 import { ReportDiagnostics } from './ReportDiagnostics';
+import { ReportCharts } from './ReportCharts';
 import { AnalysisContextSummary } from './AnalysisContextSummary';
 import { MarketReviewReportView } from './MarketReviewReportView';
 import { getReportText, normalizeReportLanguage } from '../../utils/reportLanguage';
@@ -70,6 +71,13 @@ export const ReportSummary: React.FC<ReportSummaryProps> = ({
 
       {/* 策略点位区 */}
       <ReportStrategy strategy={strategy} language={reportLanguage} />
+
+      {/* 图表区：MACD + 因子雷达 + 价格走势 */}
+      <ReportCharts
+        rawResult={details?.rawResult as Record<string, unknown> | undefined}
+        sentimentScore={summary.sentimentScore}
+        language={reportLanguage}
+      />
 
       {/* 资讯区 */}
       <ReportNews recordId={recordId} limit={8} language={reportLanguage} />

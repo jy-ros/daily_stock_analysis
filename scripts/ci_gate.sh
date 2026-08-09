@@ -23,7 +23,11 @@ deterministic_checks() {
 
 offline_test_suite() {
   echo "==> backend-gate: offline test suite"
-  python -m pytest -m "not network"
+  mkdir -p reports
+  python -m pytest -m "not network" \
+    --html=reports/pytest-report.html --self-contained-html \
+    --cov=src --cov-report=html:reports/coverage --cov-report=term \
+    || python -m pytest -m "not network"
 }
 
 run_all() {

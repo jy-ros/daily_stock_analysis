@@ -1,6 +1,7 @@
 import type React from 'react';
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import { Check, Minus, X } from 'lucide-react';
+import { LineChart, Line, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, ResponsiveContainer, ReferenceLine } from 'recharts';
 import { backtestApi } from '../api/backtest';
 import type { ParsedApiError } from '../api/error';
 import { getParsedApiError } from '../api/error';
@@ -54,6 +55,87 @@ function normalizeBacktestCode(value: string): string | undefined {
   if (!trimmed) return undefined;
   return trimmed.toUpperCase();
 }
+
+// ============ Equity Curve Chart ============
+
+function computeEquityCurve(results: BacktestResultItem[]) {
+  const sorted = [...results]
+    .filter((r) => r.analysisDate && r.netSimulatedReturnPct != null && r.positionRecommendation === 'long')
+    .sort((a, b) => (a.analysisDate || '').localeCompare(b.analysisDate || ''));
+
+  if (sorted.length === 0) return [];
+
+  let cumulative = 100;
+  let peak = 100;
+  return sorted.map((r, i) => {
+    cumulative *= 1 + (r.netSimulatedReturnPct! / 100);
+    if (cumulative > peak) peak = cumulative;
+    const drawdown = peak > 0 ? ((peak - cumulative) / peak) * 100 : 0;
+    return {
+      idx: i + 1,
+      date: r.analysisDate,
+      code: r.code,
+      cumulative: Number(cumulative.toFixed(2)),
+      drawdown: Number(-drawdown.toFixed(2)),
+      netReturn: r.netSimulatedReturnPct,
+    };
+  });
+}
+
+const EquityCurveChart: React.FC<{ results: BacktestResultItem[]; language: UiLanguage }> = ({ results, language }) => {
+  const text = BACKTEST_TEXT[language];
+  const data = useMemo(() => computeEquityCurve(results), [results]);
+
+  if (data.length < 2) return null;
+
+  const finalVal = data[data.length - 1].cumulative;
+  const totalReturn = ((finalVal - 100) / 100 * 100).toFixed(1);
+  const isPositive = finalVal >= 100;
+
+  return (
+    <Card variant="gradient" padding="md" className="animate-fade-in">
+      <div className="mb-3 flex items-center justify-between">
+        <span className="label-uppercase">{text.equityCurve || 'Equity Curve'}</span>
+        <span className={`text-sm font-mono ${isPositive ? 'text-success' : 'text-danger'}`}>
+          {isPositive ? '+' : ''}{totalReturn}%
+        </span>
+      </div>
+      <div className="h-48">
+        <ResponsiveContainer width="100%" height="100%">
+          <LineChart data={data} margin={{ top: 4, right: 4, left: -20, bottom: 0 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" />
+            <XAxis dataKey="idx" tick={{ fontSize: 10, fill: 'var(--color-muted-text, #888)' }} interval="preserveStartEnd" />
+            <YAxis tick={{ fontSize: 10, fill: 'var(--color-muted-text, #888)' }} domain={['dataMin - 2', 'dataMax + 2']} />
+            <RechartsTooltip
+              contentStyle={{ background: 'rgba(15,15,25,0.95)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 8, fontSize: 12 }}
+              formatter={(value, name) => name === 'cumulative' ? [`${Number(value).toFixed(2)}%`, text.cumulativeReturn || 'Cumulative'] : [value, name]}
+              labelFormatter={(label) => `#${label}`}
+            />
+            <ReferenceLine y={100} stroke="rgba(255,255,255,0.2)" strokeDasharray="4 4" />
+            <Line type="monotone" dataKey="cumulative" stroke={isPositive ? '#22c55e' : '#ef4444'} strokeWidth={2} dot={false} />
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+      {data.some((d) => d.drawdown < -1) && (
+        <div className="mt-2 h-20">
+          <ResponsiveContainer width="100%" height="100%">
+            <AreaChart data={data} margin={{ top: 2, right: 4, left: -20, bottom: 0 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" />
+              <XAxis dataKey="idx" tick={false} />
+              <YAxis tick={{ fontSize: 9, fill: 'var(--color-muted-text, #888)' }} />
+              <RechartsTooltip
+                contentStyle={{ background: 'rgba(15,15,25,0.95)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 8, fontSize: 11 }}
+                formatter={(value) => [`${Number(value).toFixed(2)}%`, text.maxDrawdown || 'Drawdown']}
+                labelFormatter={(label) => `#${label}`}
+              />
+              <Area type="monotone" dataKey="drawdown" stroke="#ef4444" fill="rgba(239,68,68,0.15)" strokeWidth={1} dot={false} />
+            </AreaChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+    </Card>
+  );
+};
 
 function parseEvalWindowDays(value: string): number | undefined {
   const trimmed = value.trim();
@@ -582,6 +664,9 @@ const BacktestPage: React.FC = () => {
 
           {stockPerf && (
             <PerformanceCard metrics={stockPerf} title={`${stockPerf.code || codeFilter}`} language={language} />
+          )}
+          {results.length > 0 && (
+            <EquityCurveChart results={results} language={language} />
           )}
         </div>
 

@@ -75,6 +75,13 @@ jobs:
         run: ./scripts/ci_gate.sh deterministic
       - name: ✅ Offline test suite
         run: ./scripts/ci_gate.sh offline-tests
+      - name: 📤 Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: test-reports
+          path: reports/
+          if-no-files-found: ignore
 
   docker-build:
     name: docker-build

@@ -385,35 +385,51 @@ jobs:
             
             const botComment = comments.find(c => 
               c.user.type === 'Bot' && 
-              c.body.includes('## 🤖 自动审查报告')
+              (c.body.includes('## 🤖 自动审查报告') || c.body.includes('自动审查报告'))
             );
             
-            const checkStatus = process.env.AUTO_CHECK_RESULT === 'success' ? '✅ 通过' : '⚠️ 有问题';
-            const aiStatus = process.env.AI_REVIEW_RESULT === 'success' ? '✅ 已完成' : 
+            const checkPassed = process.env.AUTO_CHECK_RESULT === 'success';
+            const aiCompleted = process.env.AI_REVIEW_RESULT === 'success';
+            const checkStatus = checkPassed ? '✅ 通过' : '❌ 失败';
+            const aiStatus = aiCompleted ? '✅ 已完成' : 
                             process.env.AI_REVIEW_RESULT === 'skipped' ? '⏭️ 跳过' : '⚠️ 失败';
+            
+            // Size classification
+            const totalChanges = additions + deletions;
+            const sizeLabel = totalChanges < 50 ? '🟢 S' : 
+                            totalChanges < 200 ? '🟡 M' : 
+                            totalChanges < 500 ? '🟠 L' : '🔴 XL';
             
             let report = `## 🤖 自动审查报告
 
-            | 项目 | 结果 |
-            |------|------|
-            | 📊 变更文件 | ${changedFiles} 个 |
-            | ➕ 新增行数 | ${additions} 行 |
-            | ➖ 删除行数 | ${deletions} 行 |
-            | 🔍 静态检查 | ${checkStatus} |
-            | 🧠 AI 审查 | ${aiStatus} |
+            <table>
+            <tr><td><b>📊 变更规模</b></td><td>${sizeLabel} · ${changedFiles} 个文件 · +${additions} / -${deletions}</td></tr>
+            <tr><td><b>🔍 静态检查</b></td><td>${checkStatus}</td></tr>
+            <tr><td><b>🧠 AI 审查</b></td><td>${aiStatus}</td></tr>
+            </table>
 
             ### 📁 修改的文件
 
+            | 状态 | 文件 | 变更 |
+            |------|------|------|
             `;
             
             for (const file of files.slice(0, 20)) {
-              const status = file.status === 'added' ? '🆕' : 
-                            file.status === 'removed' ? '🗑️' : '📝';
-              report += `- ${status} \`${file.filename}\` (+${file.additions}/-${file.deletions})\n`;
+              const icon = file.status === 'added' ? '🆕' : 
+                          file.status === 'removed' ? '🗑️' : '📝';
+              const addBar = file.additions > 0 ? `<span style="color:#2da44e">+${file.additions}</span>` : '';
+              const delBar = file.deletions > 0 ? `<span style="color:#cf222e">-${file.deletions}</span>` : '';
+              report += `| ${icon} | \`${file.filename}\` | ${addBar} ${delBar} |\n`;
             }
             
             if (files.length > 20) {
-              report += `\n... 还有 ${files.length - 20} 个文件\n`;
+              report += `\n<details><summary>还有 ${files.length - 20} 个文件</summary>\n\n`;
+              for (const file of files.slice(20)) {
+                const icon = file.status === 'added' ? '🆕' : 
+                            file.status === 'removed' ? '🗑️' : '📝';
+                report += `- ${icon} \`${file.filename}\` (+${file.additions}/-${file.deletions})\n`;
+              }
+              report += `\n</details>\n`;
             }
             
             if (aiReview) {
