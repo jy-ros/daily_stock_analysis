@@ -56,12 +56,6 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
       
-      - name: 安装 CJK 字体（图表中文渲染）
-        run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq fonts-noto-cjk
-          rm -rf ~/.cache/matplotlib/fontlist-*.json
-          python3 -c "import matplotlib; matplotlib.font_manager._load_fontmanager(try_read_cache=False); print('font cache rebuilt')"
-      
       - name: 创建必要目录
         run: |
           mkdir -p data logs reports
@@ -510,20 +504,6 @@ jobs:
             python main.py $FORCE_RUN_ARG
           fi
       
-      - name: 生成可视化图表
-        if: always()
-        run: |
-          TODAY=$(date +%Y%m%d)
-          JSON_FILE="reports/report_${TODAY}.json"
-          if [ -f "$JSON_FILE" ]; then
-            echo "📊 从 $JSON_FILE 生成图表..."
-            python3 scripts/generate_report_charts.py "$JSON_FILE" --outdir reports/charts
-            echo "✅ 图表生成完成"
-            ls -la reports/charts/ 2>/dev/null || true
-          else
-            echo "⚠️ 未找到 $JSON_FILE，跳过图表生成"
-          fi
-      
       - name: 上传分析报告
         uses: actions/upload-artifact@v6
         if: always()
@@ -534,7 +514,7 @@ jobs:
             logs/
           retention-days: 30
 
-      - name: 发送报告邮件（内嵌图表 HTML）
+      - name: 发送报告邮件（内嵌 HTML）
         if: always() && env.EMAIL_SENDER != '' && env.EMAIL_PASSWORD != '' && env.EMAIL_RECEIVERS != ''
         env:
           EMAIL_SENDER: ${{ vars.EMAIL_SENDER || secrets.EMAIL_SENDER }}
@@ -543,10 +523,9 @@ jobs:
           EMAIL_SENDER_NAME: ${{ vars.EMAIL_SENDER_NAME || secrets.EMAIL_SENDER_NAME || 'DSA 股票分析' }}
         run: |
           python3 - <<'PYEOF'
-          import os, glob, smtplib, ssl, base64, sys
+          import os, glob, smtplib, ssl
           from email.mime.multipart import MIMEMultipart
           from email.mime.text import MIMEText
-          from pathlib import Path
           from datetime import date
 
           sender = os.environ.get("EMAIL_SENDER", "")
@@ -563,6 +542,7 @@ jobs:
               print("⚠️ 无收件人，跳过发送")
               exit(0)
 
+          # Find latest report markdown
           report_files = sorted(glob.glob("reports/report_*.md"))
           if not report_files:
               print("⚠️ 未找到报告文件，跳过发送")
@@ -572,12 +552,14 @@ jobs:
           with open(latest, "r", encoding="utf-8") as f:
               md_content = f.read()
 
-          # Convert markdown to styled HTML
+          # Convert markdown to styled HTML (reuse project's formatter)
           try:
+              import sys
               sys.path.insert(0, "src")
               from formatters import markdown_to_html_document
               html_body = markdown_to_html_document(md_content)
           except ImportError:
+              # Fallback: basic markdown conversion
               import markdown2
               html_body = f"""<!DOCTYPE html>
           <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -587,32 +569,19 @@ jobs:
           {markdown2.markdown(md_content, extras=["tables","fenced-code-blocks"])}
           </body></html>"""
 
-          # Embed chart images as base64 inline
-          charts_dir = Path("reports/charts")
-          chart_files = sorted(charts_dir.glob("*.png")) if charts_dir.exists() else []
-          if chart_files:
-              charts_html = '<div style="margin:24px 0"><h2 style="border-bottom:2px solid #3B82F6;padding-bottom:8px">📊 Visual Charts</h2>'
-              charts_html += '<div style="display:flex;flex-wrap:wrap;gap:16px">'
-              for cf in chart_files:
-                  b64 = base64.b64encode(cf.read_bytes()).decode()
-                  charts_html += f'<div style="flex:1 1 45%;min-width:300px"><img src="data:image/png;base64,{b64}" style="width:100%;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1)" /></div>'
-              charts_html += '</div></div>'
-              html_body = html_body.replace("</body>", f"{charts_html}</body>")
-              print(f"📊 Embedded {len(chart_files)} chart(s) in email")
-
           today = date.today().isoformat()
-          subject = f"📊 Stock Analysis Report {today}"
+          subject = f"📊 股票分析报告 {today}"
 
-          msg = MIMEMultipart("related")
+          # Build multipart/alternative email (inline HTML + plain text fallback)
+          msg = MIMEMultipart("alternative")
           msg["Subject"] = subject
           msg["From"] = f"{sender_name} <{sender}>"
           msg["To"] = ", ".join(receivers)
 
-          alt_part = MIMEMultipart("alternative")
-          alt_part.attach(MIMEText(md_content, "plain", "utf-8"))
-          alt_part.attach(MIMEText(html_body, "html", "utf-8"))
-          msg.attach(alt_part)
+          msg.attach(MIMEText(md_content, "plain", "utf-8"))
+          msg.attach(MIMEText(html_body, "html", "utf-8"))
 
+          # Auto-detect SMTP server from domain
           domain = sender.split("@")[-1].lower()
           smtp_map = {
               "qq.com": ("smtp.qq.com", 465), "163.com": ("smtp.163.com", 465),

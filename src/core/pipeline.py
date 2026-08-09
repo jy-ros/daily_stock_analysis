@@ -3181,22 +3181,8 @@ class StockAnalysisPipeline:
             report = self._generate_aggregate_report(results, report_type)
             filepath = self.notifier.save_report_to_file(report)
             logger.info(f"决策仪表盘日报已保存: {filepath}")
-            self._save_report_json(results)
         except Exception as e:
             logger.error(f"保存本地报告失败: {e}")
-
-    def _save_report_json(self, results: List[AnalysisResult]) -> None:
-        """导出分析结果 JSON 供图表生成脚本消费"""
-        import json
-        from pathlib import Path
-
-        reports_dir = Path(__file__).parent.parent.parent / "reports"
-        reports_dir.mkdir(parents=True, exist_ok=True)
-        today = date.today().strftime("%Y%m%d")
-        json_path = reports_dir / f"report_{today}.json"
-        data = [r.to_dict() for r in results]
-        json_path.write_text(json.dumps(data, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-        logger.info(f"分析数据 JSON 已导出: {json_path}")
 
     def _send_notifications(
         self,
