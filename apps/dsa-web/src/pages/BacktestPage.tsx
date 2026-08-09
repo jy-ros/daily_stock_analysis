@@ -192,7 +192,9 @@ const PerformanceCard: React.FC<{ metrics: PerformanceMetrics; title: string; la
       <MetricRow label={text.directionAccuracy} value={pct(metrics.directionAccuracyPct)} accent />
       <MetricRow label={text.winRate} value={pct(metrics.winRatePct)} accent />
       <MetricRow label={text.avgSimulatedReturn} value={pct(metrics.avgSimulatedReturnPct)} />
+      <MetricRow label={text.avgNetReturn} value={pct(metrics.avgNetSimulatedReturnPct)} />
       <MetricRow label={text.avgStockReturn} value={pct(metrics.avgStockReturnPct)} />
+      <MetricRow label={text.totalFees} value={metrics.totalTransactionFees != null ? `$${metrics.totalTransactionFees.toFixed(2)}` : '--'} />
       <MetricRow label={text.stopLossTriggerRate} value={pct(metrics.stopLossTriggerRate)} />
       <MetricRow label={text.takeProfitTriggerRate} value={pct(metrics.takeProfitTriggerRate)} />
       <MetricRow label={text.avgDaysToFirstHit} value={metrics.avgDaysToFirstHit != null ? metrics.avgDaysToFirstHit.toFixed(1) : '--'} />
@@ -620,7 +622,7 @@ const BacktestPage: React.FC = () => {
                 <span className="backtest-table-scroll-hint">{text.scrollHint}</span>
               </div>
               <div className="backtest-table-wrapper">
-                <table className="backtest-table min-w-[900px] w-full text-sm">
+                <table className="backtest-table min-w-[1200px] w-full text-sm">
                   <thead className="backtest-table-head">
                     <tr className="text-left">
                       <th className="backtest-table-head-cell">{text.stock}</th>
@@ -634,6 +636,10 @@ const BacktestPage: React.FC = () => {
                         {showNextDayActualColumns ? text.accuracy : text.directionMatch}
                       </th>
                       <th className="backtest-table-head-cell">{text.result}</th>
+                      <th className="backtest-table-head-cell">{text.netReturn}</th>
+                      <th className="backtest-table-head-cell">{text.holdingDays}</th>
+                      <th className="backtest-table-head-cell">{text.entryDate}</th>
+                      <th className="backtest-table-head-cell">{text.exitDate}</th>
                       <th className="backtest-table-head-cell">{text.status}</th>
                     </tr>
                   </thead>
@@ -697,6 +703,18 @@ const BacktestPage: React.FC = () => {
                             </span>
                           </td>
                           <td className="backtest-table-cell">{outcomeBadge(row.outcome, language)}</td>
+                          <td className="backtest-table-cell">
+                            <span className={
+                              row.netSimulatedReturnPct != null
+                                ? row.netSimulatedReturnPct > 0 ? 'text-success' : row.netSimulatedReturnPct < 0 ? 'text-danger' : 'text-secondary-text'
+                                : 'text-muted-text'
+                            }>
+                              {pct(row.netSimulatedReturnPct)}
+                            </span>
+                          </td>
+                          <td className="backtest-table-cell text-secondary-text">{row.holdingDays ?? '--'}</td>
+                          <td className="backtest-table-cell text-secondary-text">{row.simulatedEntryDate || '--'}</td>
+                          <td className="backtest-table-cell text-secondary-text">{row.simulatedExitDate || '--'}</td>
                           <td className="backtest-table-cell">{statusBadge(row.evalStatus, language)}</td>
                         </tr>
                       );

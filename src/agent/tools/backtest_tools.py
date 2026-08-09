@@ -94,6 +94,8 @@ def _handle_get_skill_backtest_summary(skill_id: str = "", eval_window_days: int
             "direction_accuracy_pct": summary.get("direction_accuracy_pct"),
             "avg_stock_return_pct": summary.get("avg_stock_return_pct"),
             "avg_simulated_return_pct": summary.get("avg_simulated_return_pct"),
+            "avg_net_simulated_return_pct": summary.get("avg_net_simulated_return_pct"),
+            "total_transaction_fees": summary.get("total_transaction_fees"),
             "computed_at": summary.get("computed_at"),
         }
     except Exception:
@@ -192,6 +194,8 @@ def _handle_get_stock_backtest_summary(stock_code: str, eval_window_days: int = 
                 "simulated_return_pct": item.get("simulated_return_pct"),
                 "net_simulated_return_pct": item.get("net_simulated_return_pct"),
                 "holding_days": item.get("holding_days"),
+                "simulated_entry_date": item.get("simulated_entry_date"),
+                "simulated_exit_date": item.get("simulated_exit_date"),
                 "hit_stop_loss": item.get("hit_stop_loss"),
                 "hit_take_profit": item.get("hit_take_profit"),
             }
