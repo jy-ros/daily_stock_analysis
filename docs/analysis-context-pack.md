@@ -126,6 +126,8 @@ overview 不输出 `blocks.*.items`、`items.value`、`news.content`、`trend_re
 
 P4 持久化面只在 `analysis_history.context_snapshot` 顶层写入 `analysis_context_pack_overview`。运行态 prompt 字段仍会从 `enhanced_context` 和 history snapshot 中剥离：`market_phase_context`、`analysis_context_pack`、`analysis_context_pack_summary` 不进入公开历史详情或任务状态。`SAVE_CONTEXT_SNAPSHOT=false` 时不持久化整份 `analysis_history.context_snapshot`，因此也不会落库 overview、`market_phase_summary`、`enhanced_context` 或 raw snapshot 字段；旧记录或缺少 overview 的记录继续返回空字段，不影响历史详情读取。
 
+公共 overview block 可追加 `timestamp`、`provider_timestamp`、`fetched_at`：仅透传可解析的 ISO 8601 datetime，保留时区和原始值；不从任意 item 猜测整个 block 的时间，不暴露其他 metadata。`timestamp` 可能来自抓取时间，不能当作观测时间或新鲜度证明；`provider_timestamp` 与 `fetched_at` 分别保留来源观测时间和抓取时间。旧 overview 缺少字段时仍可读取。
+
 公共 API 字段固定为 `report.details.analysis_context_pack_overview`，Web 端经深度 camelCase 后读取 `analysisContextPackOverview`。接线面包括：
 
 - `GET /api/v1/history/{record_id}` 历史详情。
@@ -134,7 +136,7 @@ P4 持久化面只在 `analysis_history.context_snapshot` 顶层写入 `analysis
 
 API 返回给 Web 的 `details.context_snapshot` 会通过 `sanitize_context_snapshot_for_api()` 剥离顶层 `analysis_context_pack_overview`，避免 raw snapshot 面板重复展示或被当作完整上下文导出；overview 只从 `extract_analysis_context_pack_overview()` 单独取出。Agent 路径与普通分析路径写入同一 overview 形状，Agent 无新闻计数时 `metadata.news_result_count` 可为空。
 
-P4 Web 展示只在报告详情页渲染 `AnalysisContextSummary`，位置在策略点位和资讯之后、运行诊断之前；该区域默认折叠，折叠头部展示可用数、缺失数、非零的其他状态计数和触发来源，展开后展示数据块状态 badge、来源、warning、missing reason、状态计数和新闻结果数。P5 后折叠头部还会展示质量分/等级，展开后展示 `limitations` 和 `fetch_failed` 状态。无 overview 时不渲染占位。在 #1386 P4b 中，Web 会在同一报告详情页展示 `report.meta.market_phase_summary` 阶段标签，并继续复用该低敏数据质量摘要；不扩大完整 pack、Prompt summary、raw payload 或 snapshot 内部字段的公开面。P4/P5 不覆盖 pending/processing TaskPanel 的 AnalysisContextPack 数据质量摘要或 SSE 进行中 overview 可见性，不改通知摘要、Bot/Desktop 专属展示或 `market_review` overview。
+P4 Web 展示只在报告详情页渲染 `AnalysisContextSummary`，位置在策略点位和资讯之后、运行诊断之前；该区域默认折叠，折叠头部展示可用数、缺失数、非零的其他状态计数和触发来源，展开后的每个数据块只展示状态、来源、告警和说明。来源为空时显示“未记录输入来源”；说明行把已知缺失原因翻译为原因、对本次分析的影响和简短处理建议，并在括号中保留诊断码，未知原因则按 block 状态提供通用建议。`fallback`、`stale`、`estimated`、`partial` 等没有缺失原因的降级状态也在同一说明行解释，不新增处理、范围或证据字段。报告页相关资讯由独立接口加载，其有无不能通过 overview 的 `metadata.news_result_count` 推断；资讯区只说明自身是报告页补充资讯，输入数据块只说明新闻是否进入本次 LLM 分析，避免把两套数据范围混为同一结果集。展开区仍展示状态计数和新闻结果数。P5 后折叠头部还会展示质量分/等级，展开后展示 `limitations` 和 `fetch_failed` 状态。无 overview 时不渲染占位。在 #1386 P4b 中，Web 会在同一报告详情页展示 `report.meta.market_phase_summary` 阶段标签，并继续复用该低敏数据质量摘要；不扩大完整 pack、Prompt summary、raw payload 或 snapshot 内部字段的公开面。P4/P5 不覆盖 pending/processing TaskPanel 的 AnalysisContextPack 数据质量摘要或 SSE 进行中 overview 可见性，不改通知摘要、Bot/Desktop 专属展示或 `market_review` overview。
 
 ## P5 数据质量评分与 Prompt 数据限制
 
@@ -192,7 +194,7 @@ P6 不改变 P1-P5 的运行时行为，只把已经落地的契约、可见性�
 | `GET /api/v1/history/{record_id}` | `report.details.analysis_context_pack_overview` | 完整 pack、Prompt summary、raw `analysis_context_pack_overview` duplicate |
 | 同步 `POST /api/v1/analysis/analyze` | `report.details.analysis_context_pack_overview`，前提是本次历史已持久化 `analysis_history.context_snapshot` | 完整 pack、Prompt summary |
 | completed `GET /api/v1/analysis/status/{task_id}` | `status.result.report.details.analysis_context_pack_overview` | 完整 pack、Prompt summary |
-| Web 报告页 | 默认折叠的 `AnalysisContextSummary`，展示 block 状态、来源、缺失原因、质量分和限制 | 完整 pack、raw payload、Prompt summary |
+| Web 报告页 | 默认折叠的 `AnalysisContextSummary`，展示 block 状态、来源、告警、包含影响/建议/诊断码的说明、质量分和限制 | 完整 pack、raw payload、Prompt summary、报告页独立加载的资讯结果状态 |
 | raw `details.context_snapshot` | 剥离后的历史快照 | 顶层 `analysis_context_pack_overview`、`market_phase_summary` |
 | 通知、Bot、Desktop 专属展示 | P6 不新增专属展示 | 完整 pack、Prompt summary、raw payload |
 

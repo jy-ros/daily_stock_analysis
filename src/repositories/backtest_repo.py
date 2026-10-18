@@ -11,11 +11,10 @@ import logging
 from datetime import date, datetime, timedelta
 from typing import List, Optional, Tuple
 
-from sqlalchemy import and_, delete, desc, func, or_, select
+from sqlalchemy import and_, case, delete, desc, func, or_, select
 
-from data_provider.base import is_bse_code
 from src.core.backtest_engine import OVERALL_SENTINEL_CODE
-from src.services.stock_code_utils import normalize_code as normalize_backtest_code
+from src.services.stock_code_utils import resolve_daily_stock_identity
 
 from src.storage import BacktestResult, BacktestSummary, DatabaseManager, AnalysisHistory
 
@@ -30,6 +29,7 @@ BacktestResultContextRow = Tuple[
     Optional[str],
     Optional[str],
     Optional[str],
+    Optional[int],
 ]
 
 
@@ -183,6 +183,7 @@ class BacktestRepository:
         days: Optional[int],
         offset: int,
         limit: int,
+        code_candidates: Optional[Tuple[str, ...]] = None,
     ) -> Tuple[List[BacktestResultContextRow], int]:
         with self.db.get_session() as session:
             conditions = self._build_result_conditions(
@@ -192,6 +193,7 @@ class BacktestRepository:
                 analysis_date_from=analysis_date_from,
                 analysis_date_to=analysis_date_to,
                 days=days,
+                code_candidates=code_candidates,
             )
 
             where_clause = and_(*conditions) if conditions else True
@@ -211,6 +213,7 @@ class BacktestRepository:
                     AnalysisHistory.context_snapshot,
                     AnalysisHistory.raw_result,
                     AnalysisHistory.report_type,
+                    AnalysisHistory.sentiment_score,
                 )
                 .join(AnalysisHistory, AnalysisHistory.id == BacktestResult.analysis_history_id)
                 .where(where_clause)
@@ -252,6 +255,7 @@ class BacktestRepository:
                     AnalysisHistory.context_snapshot,
                     AnalysisHistory.raw_result,
                     AnalysisHistory.report_type,
+                    AnalysisHistory.sentiment_score,
                 )
                 .join(AnalysisHistory, AnalysisHistory.id == BacktestResult.analysis_history_id)
                 .where(where_clause)
@@ -404,14 +408,30 @@ class BacktestRepository:
         code: Optional[str],
         eval_window_days: Optional[int] = None,
         engine_version: str,
+        code_candidates: Optional[Tuple[str, ...]] = None,
     ) -> Optional[BacktestSummary]:
         with self.db.get_session() as session:
             conditions = [
                 BacktestSummary.scope == scope,
                 BacktestSummary.engine_version == engine_version,
             ]
-            if code:
-                conditions.extend(self._build_code_conditions(BacktestSummary.code, code))
+            if code or code_candidates is not None:
+                conditions.extend(self._build_code_conditions(BacktestSummary.code, code, code_candidates))
+            numeric = tuple(value for value in code_candidates or () if value.isdigit())
+            if numeric:
+                # A numeric rollup has no identity column of its own. Its
+                # contributing results must witness this identity, without a
+                # conflicting numeric source in the same rollup bucket.
+                same_bucket = (
+                    BacktestResult.eval_window_days == BacktestSummary.eval_window_days,
+                    BacktestResult.engine_version == BacktestSummary.engine_version,
+                )
+                owned = self._strict_result_code_condition(code_candidates)
+                witness = select(BacktestResult.id).where(*same_bucket, owned).correlate(BacktestSummary).exists()
+                conflict = select(BacktestResult.id).where(
+                    *same_bucket, BacktestResult.code.in_(numeric), ~owned,
+                ).correlate(BacktestSummary).exists()
+                conditions.append(or_(BacktestSummary.code.not_in(numeric), and_(witness, ~conflict)))
             if eval_window_days is not None:
                 conditions.append(BacktestSummary.eval_window_days == eval_window_days)
 
@@ -485,9 +505,12 @@ class BacktestRepository:
         analysis_date_from: Optional[date],
         analysis_date_to: Optional[date],
         days: Optional[int],
+        code_candidates: Optional[Tuple[str, ...]] = None,
     ) -> List[object]:
         conditions = []
-        if code:
+        if code_candidates is not None:
+            conditions.append(BacktestRepository._strict_result_code_condition(code_candidates))
+        elif code:
             conditions.extend(BacktestRepository._build_code_conditions(BacktestResult.code, code))
         if eval_window_days is not None:
             conditions.append(BacktestResult.eval_window_days == eval_window_days)
@@ -503,7 +526,31 @@ class BacktestRepository:
         return conditions
 
     @staticmethod
-    def _build_code_conditions(column, code: str) -> List[object]:
+    def _strict_result_code_condition(code_candidates: Tuple[str, ...]):
+        """Use the fixed storage namespace and existing source FK, not an index.
+
+        Qualified keys retain their existing identity. Numeric CN writer keys
+        additionally require a same-object source code and no contrary persisted
+        market. Missing market uses the writer's bare-CN storage convention.
+        """
+        numeric = tuple(value for value in code_candidates if value.isdigit())
+        if not numeric:
+            return BacktestResult.code.in_(code_candidates)
+        qualified = tuple(value for value in code_candidates if not value.isdigit())
+        snapshot = case((func.json_valid(AnalysisHistory.context_snapshot), AnalysisHistory.context_snapshot), else_="{}")
+        market = func.json_extract(snapshot, "$.market_phase_summary.market")
+        source = select(AnalysisHistory.id).where(
+            AnalysisHistory.id == BacktestResult.analysis_history_id,
+            AnalysisHistory.code.in_(code_candidates),
+            or_(market.is_(None), func.lower(market) == "cn"),
+        ).correlate(BacktestResult).exists()
+        return or_(BacktestResult.code.in_(qualified), and_(BacktestResult.code.in_(numeric), source))
+
+    @staticmethod
+    def _build_code_conditions(column, code: Optional[str], code_candidates: Optional[Tuple[str, ...]] = None) -> List[object]:
+        if code_candidates is not None:
+            # An empty explicit constraint means no matches, not legacy/all rows.
+            return [column.in_(code_candidates)]
         if not code:
             return []
 
@@ -513,136 +560,16 @@ class BacktestRepository:
         else:
             raw_code = raw_code.upper()
 
-        normalized_code = normalize_backtest_code(raw_code)
-
-        candidates = [raw_code]
-        if normalized_code and normalized_code != raw_code:
-            candidates.append(normalized_code)
-        candidates.extend(BacktestRepository._build_market_code_variants(raw_code, normalized_code))
+        if raw_code == OVERALL_SENTINEL_CODE:
+            candidates = [OVERALL_SENTINEL_CODE]
+        else:
+            identity = resolve_daily_stock_identity(raw_code)
+            candidates = list(identity.code_candidates) if identity is not None else []
+        if not candidates:
+            return [column.in_([])]
 
         if len(candidates) == 1:
             return [column == candidates[0]]
 
         unique = list(dict.fromkeys(candidates))
         return [or_(*[column == candidate for candidate in unique])]
-
-    @staticmethod
-    def _build_hk_market_variants(hk_digits: str) -> List[str]:
-        """Build normalized HK variants for padded/unpadded code shapes."""
-        if not hk_digits.isdigit() or not hk_digits:
-            return []
-
-        padded = hk_digits.zfill(5)
-        unpadded = padded.lstrip("0") or "0"
-
-        variants: List[str] = [
-            f"HK{padded}",
-            f"{padded}.HK",
-            padded,
-            f"HK{unpadded}",
-            f"{unpadded}.HK",
-            f"HK.{padded}",
-        ]
-        if unpadded == padded:
-            variants.pop(3)
-            variants.pop(3)
-
-        # Keep legacy no-leading-zero bare form for 1-3 digit inputs.
-        if len(unpadded) <= 3 and unpadded != padded:
-            variants.append(unpadded)
-            variants.append(f"HK.{unpadded}")
-
-        return variants
-
-    @staticmethod
-    def _build_market_code_variants(raw_code: str, normalized_code: str) -> List[str]:
-        """Return additional market-formatted variants for safe stock-code matching."""
-        variants: List[str] = []
-        if not raw_code:
-            return variants
-
-        raw_code_upper = raw_code.upper()
-        normalized_upper = normalized_code.upper() if normalized_code else ""
-
-        def _add_us_variants(code: str) -> None:
-            if not code:
-                return
-            if code.endswith(".US"):
-                bare = code[:-3]
-                if bare.isalpha() and 1 <= len(bare) <= 5:
-                    variants.append(bare)
-                return
-            if "." not in code and code.isalpha() and 1 <= len(code) <= 5:
-                variants.append(f"{code}.US")
-
-        _add_us_variants(raw_code_upper)
-        if normalized_upper != raw_code_upper:
-            _add_us_variants(normalized_upper)
-
-        def _explicit_exchange() -> Optional[str]:
-            if raw_code_upper.startswith(("SH", "SS")) or raw_code_upper.endswith((".SH", ".SS")):
-                return "SH"
-            if raw_code_upper.startswith("SZ") or raw_code_upper.endswith(".SZ"):
-                return "SZ"
-            if raw_code_upper.startswith("BJ") or raw_code_upper.endswith(".BJ"):
-                return "BJ"
-            return None
-
-        def _exchange_by_code(base: str) -> str:
-            if is_bse_code(base):
-                return "BJ"
-            if base.startswith(("5", "6")):
-                return "SH"
-            return "SZ"
-
-        if normalized_upper.isdigit() and len(normalized_upper) == 6:
-            explicit_exchange = _explicit_exchange()
-            if explicit_exchange is not None and explicit_exchange != _exchange_by_code(normalized_upper):
-                return []
-
-            if raw_code_upper.startswith(("SH", "SS")) or raw_code_upper.endswith(".SH") or raw_code_upper.endswith(".SS"):
-                exchange = "SH"
-            elif raw_code_upper.startswith("SZ") or raw_code_upper.endswith(".SZ"):
-                exchange = "SZ"
-            elif raw_code_upper.startswith("BJ") or raw_code_upper.endswith(".BJ") or is_bse_code(normalized_upper):
-                exchange = "BJ"
-            elif normalized_upper.startswith(("5", "6", "9")):
-                exchange = "SH"
-            else:
-                exchange = "SZ"
-
-            variants.append(f"{exchange}{normalized_upper}")
-            variants.append(f"{normalized_upper}.{exchange}")
-            variants.append(f"{exchange}.{normalized_upper}")
-            if exchange == "SH":
-                variants.append(f"SS{normalized_upper}")
-                variants.append(f"{normalized_upper}.SS")
-                variants.append(f"SS.{normalized_upper}")
-
-        if (
-            normalized_upper.startswith("HK")
-            and len(normalized_upper) > 2
-            and normalized_upper[2:].isdigit()
-            and len(normalized_upper[2:]) <= 5
-        ):
-            variants.extend(BacktestRepository._build_hk_market_variants(normalized_upper[2:]))
-
-        if (
-            raw_code_upper.startswith("HK.")
-            and raw_code_upper[3:].isdigit()
-            and len(raw_code_upper[3:]) <= 5
-        ):
-            variants.extend(BacktestRepository._build_hk_market_variants(raw_code_upper[3:]))
-
-        if (
-            raw_code_upper.endswith(".HK")
-            and raw_code_upper[:-3].isdigit()
-            and 1 <= len(raw_code_upper[:-3]) <= 5
-        ):
-            hk_digits = raw_code_upper.rsplit(".", 1)[0]
-            variants.extend(BacktestRepository._build_hk_market_variants(hk_digits))
-
-        if raw_code_upper.isdigit() and len(raw_code_upper) in (4, 5):
-            variants.extend(BacktestRepository._build_hk_market_variants(raw_code_upper))
-
-        return variants

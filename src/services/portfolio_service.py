@@ -474,7 +474,10 @@ class PortfolioService:
         account_id: Optional[int] = None,
         as_of: Optional[date] = None,
         cost_method: str = "fifo",
+        include_realtime: bool = True,
+        read_only: bool = False,
     ) -> Dict[str, Any]:
+        """Replay holdings; read-only callers skip live quotes and snapshot writes."""
         as_of_date = as_of or date.today()
         method = self._normalize_cost_method(cost_method)
 
@@ -499,26 +502,32 @@ class PortfolioService:
         }
 
         for account in account_rows:
-            account_snapshot = self._replay_account(account=account, as_of_date=as_of_date, cost_method=method)
-
-            self.repo.replace_positions_lots_and_snapshot(
-                account_id=account.id,
-                snapshot_date=as_of_date,
+            account_snapshot = self._replay_account(
+                account=account,
+                as_of_date=as_of_date,
                 cost_method=method,
-                base_currency=account.base_currency,
-                total_cash=account_snapshot["total_cash"],
-                total_market_value=account_snapshot["total_market_value"],
-                total_equity=account_snapshot["total_equity"],
-                unrealized_pnl=account_snapshot["unrealized_pnl"],
-                realized_pnl=account_snapshot["realized_pnl"],
-                fee_total=account_snapshot["fee_total"],
-                tax_total=account_snapshot["tax_total"],
-                fx_stale=account_snapshot["fx_stale"],
-                payload=json.dumps(account_snapshot["payload"], ensure_ascii=False),
-                positions=account_snapshot["positions_cache"],
-                lots=account_snapshot["lots_cache"],
-                valuation_currency=account.base_currency,
+                include_realtime=include_realtime and not read_only,
             )
+
+            if not read_only:
+                self.repo.replace_positions_lots_and_snapshot(
+                    account_id=account.id,
+                    snapshot_date=as_of_date,
+                    cost_method=method,
+                    base_currency=account.base_currency,
+                    total_cash=account_snapshot["total_cash"],
+                    total_market_value=account_snapshot["total_market_value"],
+                    total_equity=account_snapshot["total_equity"],
+                    unrealized_pnl=account_snapshot["unrealized_pnl"],
+                    realized_pnl=account_snapshot["realized_pnl"],
+                    fee_total=account_snapshot["fee_total"],
+                    tax_total=account_snapshot["tax_total"],
+                    fx_stale=account_snapshot["fx_stale"],
+                    payload=json.dumps(account_snapshot["payload"], ensure_ascii=False),
+                    positions=account_snapshot["positions_cache"],
+                    lots=account_snapshot["lots_cache"],
+                    valuation_currency=account.base_currency,
+                )
 
             accounts_payload.append(account_snapshot["public"])
             aggregate["limitations"] = _merge_portfolio_limitations(
@@ -538,6 +547,7 @@ class PortfolioService:
                 to_currency=aggregate_currency,
                 as_of_date=as_of_date,
             )
+            account_snapshot["public"]["total_market_value_aggregate"] = round(mv_cny, 6)
             eq_cny, stale_eq, _ = self._convert_amount(
                 amount=account_snapshot["total_equity"],
                 from_currency=account.base_currency,
@@ -768,7 +778,14 @@ class PortfolioService:
 
         return quantity_held
 
-    def _replay_account(self, *, account: Any, as_of_date: date, cost_method: str) -> Dict[str, Any]:
+    def _replay_account(
+        self,
+        *,
+        account: Any,
+        as_of_date: date,
+        cost_method: str,
+        include_realtime: bool,
+    ) -> Dict[str, Any]:
         trades = self.repo.list_trades(account.id, as_of=as_of_date)
         cash_ledger = self.repo.list_cash_ledger(account.id, as_of=as_of_date)
         corporate_actions = self.repo.list_corporate_actions(account.id, as_of=as_of_date)
@@ -927,6 +944,7 @@ class PortfolioService:
             cost_method=cost_method,
             fifo_lots=fifo_lots,
             avg_state=avg_state,
+            include_realtime=include_realtime,
         )
         fx_stale = fx_stale or stale_pos
 
@@ -998,6 +1016,7 @@ class PortfolioService:
         cost_method: str,
         fifo_lots: Dict[Tuple[str, str, str], List[Dict[str, Any]]],
         avg_state: Dict[Tuple[str, str, str], _AvgState],
+        include_realtime: bool = True,
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], float, float, bool]:
         position_rows: List[Dict[str, Any]] = []
         lot_rows: List[Dict[str, Any]] = []
@@ -1012,7 +1031,7 @@ class PortfolioService:
             keys = list(avg_state.keys())
 
         active_symbols: List[str] = []
-        if as_of_date == date.today():
+        if include_realtime and as_of_date == date.today():
             for key in sorted(keys):
                 symbol, _, _ = key
                 if cost_method == "fifo":
@@ -1065,6 +1084,7 @@ class PortfolioService:
                 symbol=symbol,
                 as_of_date=as_of_date,
                 realtime_prices=realtime_prices,
+                include_realtime=include_realtime,
             )
             last_price = price_info.price
             limitations = _portfolio_limitations_for_market(market)
@@ -1128,10 +1148,11 @@ class PortfolioService:
         symbol: str,
         as_of_date: date,
         realtime_prices: Optional[Dict[str, Tuple[Optional[float], Optional[str]]]] = None,
+        include_realtime: bool = True,
     ) -> _ResolvedPositionPrice:
         today = date.today()
 
-        if as_of_date == today:
+        if include_realtime and as_of_date == today:
             if realtime_prices is None:
                 realtime_price, provider = self._fetch_realtime_position_price(symbol)
             else:

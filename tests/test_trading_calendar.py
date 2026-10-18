@@ -14,6 +14,25 @@ import pandas as pd
 from src.core import trading_calendar
 
 
+def test_trading_dates_preserve_session_labels_with_utc_timezone():
+    sessions = pd.to_datetime(["2024-02-08", "2024-02-19"], utc=True)
+    calendar = SimpleNamespace(sessions_in_range=lambda start, end: sessions)
+    with patch.object(trading_calendar, "_XCALS_AVAILABLE", True), \
+            patch.object(trading_calendar.xcals, "get_calendar", return_value=calendar):
+        result = trading_calendar.get_trading_dates("cn", date(2024, 2, 8), date(2024, 2, 19))
+    assert result.equals(sessions.tz_localize(None))
+
+
+def test_trading_dates_do_not_fail_open_outside_calendar_range():
+    with patch.object(trading_calendar, "_XCALS_AVAILABLE", True), \
+            patch.object(trading_calendar.xcals, "get_calendar", side_effect=ValueError("out of range")):
+        assert trading_calendar.get_trading_dates("cn", date(2000, 1, 1), date(2000, 1, 2)) is None
+
+
+def test_trading_dates_do_not_invent_sessions_for_unknown_market():
+    assert trading_calendar.get_trading_dates("unknown", date(2024, 1, 2), date(2024, 1, 3)) is None
+
+
 class _FakeCalendar:
     def __init__(
         self,
@@ -113,6 +132,112 @@ class _NaiveTimestampCalendar(_FakeCalendar):
 
     def session_close(self, session: pd.Timestamp) -> pd.Timestamp:
         return pd.Timestamp(datetime.combine(session.date(), time(self._close_hour, 0)))
+
+
+class _CloseTimeCalendar(_FakeCalendar):
+    """Calendar with a minute-level close time; _FakeCalendar only models hour close."""
+
+    def __init__(
+        self,
+        *,
+        sessions,
+        close_time: time,
+        tz_name: str,
+        open_time: time = time(9, 30),
+        break_start: Optional[time] = None,
+        break_end: Optional[time] = None,
+    ):
+        super().__init__(
+            sessions=sessions,
+            close_hour=close_time.hour,
+            tz_name=tz_name,
+            open_time=open_time,
+            break_start=break_start,
+            break_end=break_end,
+        )
+        self._close_time = close_time
+
+    def session_close(self, session: pd.Timestamp) -> pd.Timestamp:
+        local_close = datetime.combine(
+            session.date(), self._close_time, tzinfo=ZoneInfo(self._tz_name)
+        )
+        return pd.Timestamp(local_close).tz_convert("UTC")
+
+
+class HistoricalDailyBarDateTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.calendar = _FakeCalendar(
+            sessions=[date(2024, 1, 5), date(2024, 1, 8)],
+            close_hour=15,
+            tz_name="Asia/Shanghai",
+        )
+
+    def _resolve(self, target_date: date, phase: Optional[str]) -> Optional[date]:
+        with patch.object(trading_calendar, "_XCALS_AVAILABLE", True), patch.object(
+            trading_calendar,
+            "xcals",
+            _calendar_namespace(self.calendar),
+            create=True,
+        ):
+            return trading_calendar.resolve_historical_daily_bar_date(
+                "cn",
+                target_date,
+                phase,
+            )
+
+    def test_open_session_phase_uses_previous_session(self):
+        for phase in (
+            "premarket",
+            "intraday",
+            "lunch_break",
+            "closing_auction",
+        ):
+            with self.subTest(phase=phase):
+                self.assertEqual(
+                    self._resolve(date(2024, 1, 8), phase),
+                    date(2024, 1, 5),
+                )
+
+    def test_postmarket_uses_current_session(self):
+        self.assertEqual(
+            self._resolve(date(2024, 1, 8), "postmarket"),
+            date(2024, 1, 8),
+        )
+
+    def test_non_session_and_unprovable_phase_fail_closed(self):
+        self.assertEqual(
+            self._resolve(date(2024, 1, 7), "non_trading"),
+            date(2024, 1, 5),
+        )
+        for phase in (None, "unknown", "postmarket"):
+            with self.subTest(phase=phase):
+                self.assertIsNone(self._resolve(date(2024, 1, 7), phase))
+
+
+class NextTradingDateTestCase(unittest.TestCase):
+    def _next(self, calendar, check_date: date) -> Optional[date]:
+        with patch.object(trading_calendar, "_XCALS_AVAILABLE", True), patch.object(
+            trading_calendar,
+            "xcals",
+            _calendar_namespace(calendar),
+            create=True,
+        ):
+            return trading_calendar.get_next_trading_date("cn", check_date)
+
+    def test_skips_holiday_to_next_session(self):
+        calendar = _FakeCalendar(
+            sessions=[date(2024, 9, 30), date(2024, 10, 8)],
+            close_hour=15,
+            tz_name="Asia/Shanghai",
+        )
+        self.assertEqual(self._next(calendar, date(2024, 9, 30)), date(2024, 10, 8))
+
+    def test_returns_none_instead_of_failing_open(self):
+        calendar = _FakeCalendar(sessions=[date(2024, 9, 30)], close_hour=15, tz_name="Asia/Shanghai")
+        self.assertIsNone(self._next(calendar, date(2024, 9, 30)))  # beyond calendar range
+        with patch.object(trading_calendar, "_XCALS_AVAILABLE", False):
+            self.assertIsNone(trading_calendar.get_next_trading_date("cn", date(2024, 9, 30)))
+        self.assertIsNone(trading_calendar.get_next_trading_date("unknown", date(2024, 9, 30)))
 
 
 class EffectiveTradingDateTestCase(unittest.TestCase):
@@ -384,6 +509,84 @@ class InferMarketPhaseTestCase(unittest.TestCase):
         for current_time, expected in cases:
             with self.subTest(current_time=current_time):
                 self.assertEqual(self._infer_with_calendar("us", current_time, fake_calendar), expected)
+
+    def test_tw_phase_boundaries_include_five_minute_closing_window(self):
+        # TWSE: continuous 09:00-13:30, no lunch break, 13:25-13:30 closing auction.
+        fake_calendar = _CloseTimeCalendar(
+            sessions=[date(2026, 3, 27)],
+            close_time=time(13, 30),
+            tz_name="Asia/Taipei",
+            open_time=time(9, 0),
+            break_start=None,
+            break_end=None,
+        )
+
+        tz = ZoneInfo("Asia/Taipei")
+        cases = (
+            (datetime(2026, 3, 27, 8, 59, tzinfo=tz), trading_calendar.MarketPhase.PREMARKET),
+            (datetime(2026, 3, 27, 9, 0, tzinfo=tz), trading_calendar.MarketPhase.INTRADAY),
+            (datetime(2026, 3, 27, 13, 24, tzinfo=tz), trading_calendar.MarketPhase.INTRADAY),
+            (datetime(2026, 3, 27, 13, 25, tzinfo=tz), trading_calendar.MarketPhase.CLOSING_AUCTION),
+            (datetime(2026, 3, 27, 13, 29, tzinfo=tz), trading_calendar.MarketPhase.CLOSING_AUCTION),
+            (datetime(2026, 3, 27, 13, 30, tzinfo=tz), trading_calendar.MarketPhase.POSTMARKET),
+        )
+
+        for current_time, expected in cases:
+            with self.subTest(current_time=current_time):
+                self.assertEqual(self._infer_with_calendar("tw", current_time, fake_calendar), expected)
+
+    def test_jp_phase_boundaries_include_lunch_and_five_minute_closing_window(self):
+        # TSE domestic stocks: 09:00-11:30, 12:30-15:30, closing auction 15:25-15:30.
+        fake_calendar = _CloseTimeCalendar(
+            sessions=[date(2026, 3, 27)],
+            close_time=time(15, 30),
+            tz_name="Asia/Tokyo",
+            open_time=time(9, 0),
+            break_start=time(11, 30),
+            break_end=time(12, 30),
+        )
+
+        tz = ZoneInfo("Asia/Tokyo")
+        cases = (
+            (datetime(2026, 3, 27, 8, 59, tzinfo=tz), trading_calendar.MarketPhase.PREMARKET),
+            (datetime(2026, 3, 27, 9, 0, tzinfo=tz), trading_calendar.MarketPhase.INTRADAY),
+            (datetime(2026, 3, 27, 11, 30, tzinfo=tz), trading_calendar.MarketPhase.LUNCH_BREAK),
+            (datetime(2026, 3, 27, 12, 30, tzinfo=tz), trading_calendar.MarketPhase.INTRADAY),
+            (datetime(2026, 3, 27, 15, 24, tzinfo=tz), trading_calendar.MarketPhase.INTRADAY),
+            (datetime(2026, 3, 27, 15, 25, tzinfo=tz), trading_calendar.MarketPhase.CLOSING_AUCTION),
+            (datetime(2026, 3, 27, 15, 29, tzinfo=tz), trading_calendar.MarketPhase.CLOSING_AUCTION),
+            (datetime(2026, 3, 27, 15, 30, tzinfo=tz), trading_calendar.MarketPhase.POSTMARKET),
+        )
+
+        for current_time, expected in cases:
+            with self.subTest(current_time=current_time):
+                self.assertEqual(self._infer_with_calendar("jp", current_time, fake_calendar), expected)
+
+    def test_kr_phase_boundaries_include_ten_minute_closing_window_without_lunch(self):
+        # KRX regular session: 09:00-15:30, closing auction 15:20-15:30.
+        fake_calendar = _CloseTimeCalendar(
+            sessions=[date(2026, 3, 27)],
+            close_time=time(15, 30),
+            tz_name="Asia/Seoul",
+            open_time=time(9, 0),
+            break_start=None,
+            break_end=None,
+        )
+
+        tz = ZoneInfo("Asia/Seoul")
+        cases = (
+            (datetime(2026, 3, 27, 8, 59, tzinfo=tz), trading_calendar.MarketPhase.PREMARKET),
+            (datetime(2026, 3, 27, 9, 0, tzinfo=tz), trading_calendar.MarketPhase.INTRADAY),
+            (datetime(2026, 3, 27, 12, 0, tzinfo=tz), trading_calendar.MarketPhase.INTRADAY),
+            (datetime(2026, 3, 27, 15, 19, tzinfo=tz), trading_calendar.MarketPhase.INTRADAY),
+            (datetime(2026, 3, 27, 15, 20, tzinfo=tz), trading_calendar.MarketPhase.CLOSING_AUCTION),
+            (datetime(2026, 3, 27, 15, 29, tzinfo=tz), trading_calendar.MarketPhase.CLOSING_AUCTION),
+            (datetime(2026, 3, 27, 15, 30, tzinfo=tz), trading_calendar.MarketPhase.POSTMARKET),
+        )
+
+        for current_time, expected in cases:
+            with self.subTest(current_time=current_time):
+                self.assertEqual(self._infer_with_calendar("kr", current_time, fake_calendar), expected)
 
     def test_unknown_market_and_calendar_failures_return_unknown(self):
         current_time = datetime(2026, 3, 27, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))

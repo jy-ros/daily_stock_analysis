@@ -7,3 +7,4 @@ pytest
 pytest-html
 pytest-cov
 coverage
+pytest-timeout>=2.3.0

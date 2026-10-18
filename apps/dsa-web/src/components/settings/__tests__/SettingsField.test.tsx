@@ -68,7 +68,7 @@ describe('SettingsField', () => {
     );
 
     expect(screen.getByLabelText('TickFlow 日 K 优先级')).toBeInTheDocument();
-    expect(screen.getByText(/控制 TickFlow 在 A 股日 K 数据源回退链中的尝试顺序/)).toBeInTheDocument();
+    expect(screen.getByText(/控制 TickFlow 在普通 A 股日 K 回退链中的尝试顺序/)).toBeInTheDocument();
     expect(screen.queryByText(/Priority for TickFlow daily K-line fetcher/)).not.toBeInTheDocument();
   });
   it('uses schema key for TickFlow localization when the runtime item key differs', () => {
@@ -589,7 +589,7 @@ describe('SettingsField', () => {
     expect(dialog).not.toHaveTextContent('GENERATION_BACKEND');
     expect(dialog).not.toHaveTextContent('配置样例');
     expect(dialog).not.toHaveTextContent('Phase 1');
-    expect(dialog).toHaveTextContent('本机已安装并登录 Codex CLI');
+    expect(dialog).toHaveTextContent('本机已安装并登录对应 CLI');
     expect(dialog).toHaveTextContent('默认模型配置会继续使用现有 API Key');
     expect(dialog).not.toHaveTextContent('高级说明');
     expect(dialog).not.toHaveTextContent('LiteLLM');

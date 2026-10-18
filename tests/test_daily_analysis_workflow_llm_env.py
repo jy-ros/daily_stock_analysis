@@ -24,6 +24,7 @@ EXPECTED_TEMPLATE_CHANNELS = {
     "volcengine",
     "siliconflow",
     "openrouter",
+    "requesty",
     "gemini",
     "anthropic",
     "openai",
@@ -66,6 +67,7 @@ def test_daily_analysis_maps_all_provider_template_channels() -> None:
         prefix = f"LLM_{channel.upper()}_"
         for suffix in (
             "PROTOCOL",
+            "API_SURFACE",
             "BASE_URL",
             "API_KEY",
             "API_KEYS",
@@ -78,6 +80,13 @@ def test_daily_analysis_maps_all_provider_template_channels() -> None:
     assert not any(key.startswith("LLM_ARK_") for key in env)
 
 
+def test_daily_analysis_accepts_modelflare_one_key_from_secrets() -> None:
+    assert _load_daily_analysis_env()["MODELFLARE_KEY"] == "${{ secrets.MODELFLARE_KEY }}"
+    workflow = yaml.safe_load(WORKFLOW_PATH.read_text(encoding="utf-8"))
+    analyze = next(step for step in workflow["jobs"]["analyze"]["steps"] if step.get("name") == "执行股票分析")
+    assert '[ -n "$MODELFLARE_KEY" ]' in analyze["run"]
+
+
 def test_daily_analysis_keeps_channel_secrets_in_secrets_context() -> None:
     templates = _extract_provider_templates()
     env = _load_daily_analysis_env()
@@ -88,7 +97,7 @@ def test_daily_analysis_keeps_channel_secrets_in_secrets_context() -> None:
             key = f"LLM_{upper}_{suffix}"
             assert env[key] == f"${{{{ secrets.{key} }}}}"
 
-        for suffix in ("PROTOCOL", "BASE_URL", "MODELS", "ENABLED", "EXTRA_HEADERS"):
+        for suffix in ("PROTOCOL", "API_SURFACE", "BASE_URL", "MODELS", "ENABLED", "EXTRA_HEADERS"):
             key = f"LLM_{upper}_{suffix}"
             assert f"vars.{key}" in env[key]
             assert f"secrets.{key}" in env[key]

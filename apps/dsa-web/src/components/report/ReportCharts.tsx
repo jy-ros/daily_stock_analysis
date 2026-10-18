@@ -4,12 +4,12 @@ import {
   ResponsiveContainer, ReferenceLine, RadarChart, PolarGrid,
   PolarAngleAxis, PolarRadiusAxis, Radar,
 } from 'recharts';
-import type { UiLanguage } from '../../i18n/uiText';
+import type { ReportLanguage } from '../../types/analysis';
 
 interface ReportChartsProps {
   rawResult?: Record<string, unknown>;
   sentimentScore?: number | null;
-  language: UiLanguage;
+  language: ReportLanguage;
 }
 
 const LABELS = {
@@ -43,6 +43,21 @@ const LABELS = {
     factor: 'Factor',
     risk: 'Risk',
   },
+  ko: {
+    macdTitle: 'MACD 추세 (7일)',
+    radarTitle: '다차원 팩터 평점',
+    priceTitle: '최근 가격 추이',
+    dif: 'DIF',
+    dea: 'DEA',
+    bar: 'MACD 막대',
+    price: '종가',
+    trend: '추세',
+    momentum: '모멘텀',
+    volatility: '변동성',
+    sentiment: '감정',
+    factor: '팩터',
+    risk: '리스크',
+  },
 } as const;
 
 function toNum(v: unknown): number | undefined {
@@ -62,7 +77,7 @@ function extractMacdData(raw: Record<string, unknown>): Array<Record<string, unk
   }));
 }
 
-function extractRadarData(raw: Record<string, unknown>, sentimentScore: number | null | undefined, language: UiLanguage) {
+function extractRadarData(raw: Record<string, unknown>, sentimentScore: number | null | undefined, language: ReportLanguage) {
   const labels = LABELS[language];
   const quant = raw['quant'] as Record<string, unknown> | undefined;
   const macdScore = toNum(raw['macd_composite_score']);
@@ -97,8 +112,8 @@ export const ReportCharts: React.FC<ReportChartsProps> = ({ rawResult, sentiment
   );
 
   const radarData = useMemo(
-    () => (rawResult ? extractRadarData(rawResult, sentimentScore) : []),
-    [rawResult, sentimentScore],
+    () => (rawResult ? extractRadarData(rawResult, sentimentScore, language) : []),
+    [rawResult, sentimentScore, language],
   );
 
   const priceData = useMemo(() => macdData.filter((d) => d.close != null), [macdData]);

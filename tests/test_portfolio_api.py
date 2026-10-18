@@ -24,7 +24,7 @@ except ModuleNotFoundError:
 import src.auth as auth
 from api.app import create_app
 from src.config import Config
-from src.services.portfolio_service import PortfolioBusyError
+from src.services.portfolio_service import PortfolioBusyError, PortfolioService
 from src.storage import DatabaseManager
 
 
@@ -178,6 +178,88 @@ class PortfolioApiTestCase(unittest.TestCase):
         self.assertAlmostEqual(account_snapshot["total_cash"], 0.0, places=6)
         self.assertAlmostEqual(account_snapshot["total_market_value"], 11000.0, places=6)
         self.assertAlmostEqual(account_snapshot["total_equity"], 11000.0, places=6)
+
+    def test_snapshot_exposes_per_account_values_in_aggregate_currency(self) -> None:
+        cn_id = self._create_position(name="CNY Account", quantity=1)
+        us_id = self._create_position(name="USD Account", symbol="AAPL", quantity=1, market="us", currency="USD")
+        self._save_close("600519", date(2026, 1, 3), 70)
+        self._save_close("AAPL", date(2026, 1, 3), 100)
+        service = PortfolioService()
+
+        for stale in (False, True):
+            with self.subTest(fx_stale=stale):
+                service.repo.save_fx_rate(
+                    from_currency="USD", to_currency="CNY", rate_date=date(2026, 1, 3),
+                    rate=7, source="manual", is_stale=stale,
+                )
+                response = self.client.get(
+                    "/api/v1/portfolio/snapshot",
+                    params={"as_of": "2026-01-03", "include_realtime": False},
+                )
+                self.assertEqual(response.status_code, 200, response.text)
+                snapshot = response.json()
+                accounts = {item["account_id"]: item for item in snapshot["accounts"]}
+                self.assertEqual(snapshot["currency"], "CNY")
+                self.assertEqual(snapshot["total_market_value"], 770)
+                self.assertEqual(snapshot["fx_stale"], stale)
+                self.assertEqual(accounts[cn_id]["total_market_value_aggregate"], 70)
+                self.assertEqual(accounts[us_id]["total_market_value_aggregate"], 700)
+                self.assertEqual(accounts[us_id]["total_market_value"], 100)
+                self.assertEqual(accounts[us_id]["positions"][0]["market_value_base"], 100)
+
+                response = self.client.get(
+                    "/api/v1/portfolio/snapshot",
+                    params={"account_id": us_id, "as_of": "2026-01-03", "include_realtime": False},
+                )
+                self.assertEqual(response.status_code, 200, response.text)
+                selected = response.json()
+                self.assertEqual(selected["total_market_value"], 700)
+                self.assertEqual(selected["accounts"][0]["total_market_value_aggregate"], 700)
+
+    def test_snapshot_include_realtime_false_skips_realtime_quote(self) -> None:
+        today = date.today()
+        create_resp = self.client.post(
+            "/api/v1/portfolio/accounts",
+            json={"name": "Fast", "broker": "Demo", "market": "cn", "base_currency": "CNY"},
+        )
+        self.assertEqual(create_resp.status_code, 200)
+        account_id = create_resp.json()["id"]
+
+        trade_resp = self.client.post(
+            "/api/v1/portfolio/trades",
+            json={
+                "account_id": account_id,
+                "symbol": "600519",
+                "trade_date": today.isoformat(),
+                "side": "buy",
+                "quantity": 10,
+                "price": 100,
+                "fee": 0,
+                "tax": 0,
+                "market": "cn",
+                "currency": "CNY",
+            },
+        )
+        self.assertEqual(trade_resp.status_code, 200, trade_resp.text)
+        self._save_close("600519", today, 118.0)
+
+        with patch(
+            "src.services.portfolio_service.PortfolioService._fetch_realtime_position_price",
+            side_effect=AssertionError("include_realtime=false should not fetch realtime quote"),
+        ):
+            snapshot_resp = self.client.get(
+                "/api/v1/portfolio/snapshot",
+                params={
+                    "account_id": account_id,
+                    "as_of": today.isoformat(),
+                    "include_realtime": "false",
+                },
+            )
+
+        self.assertEqual(snapshot_resp.status_code, 200, snapshot_resp.text)
+        position = snapshot_resp.json()["accounts"][0]["positions"][0]
+        self.assertEqual(position["price_source"], "history_close")
+        self.assertAlmostEqual(position["last_price"], 118.0, places=6)
 
     def test_snapshot_exposes_partial_quality_fields_for_mixed_position_markets(self) -> None:
         create_resp = self.client.post(

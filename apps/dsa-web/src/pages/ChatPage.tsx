@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { ChevronDown, SlidersHorizontal } from 'lucide-react';
@@ -7,8 +7,8 @@ import { cn } from '../utils/cn';
 import { agentApi } from '../api/agent';
 import { systemConfigApi } from '../api/systemConfig';
 import { ApiErrorAlert, Badge, Button, ConfirmDialog, EmptyState, InlineAlert, ScrollArea, Tooltip } from '../components/common';
-import { getParsedApiError } from '../api/error';
-import type { SkillInfo } from '../api/agent';
+import { createParsedApiError, getParsedApiError } from '../api/error';
+import type { AgentStatusResponse, SkillInfo } from '../api/agent';
 import { DashboardStateBlock } from '../components/dashboard';
 import {
   useAgentChatStore,
@@ -26,33 +26,32 @@ import {
 } from '../utils/chatFollowUp';
 import { isNearBottom } from '../utils/chatScroll';
 import { getReportText } from '../utils/reportLanguage';
-import { extractStockCodesFromMessage } from '../utils/chatStockCode';
-import { findMatchingStockCode, includesStockCode, normalizeStockCode } from '../utils/stockCode';
+import {
+  findMatchingStockCode,
+  includesStockCode,
+  resolveRegisteredIndexCanonical,
+} from '../utils/stockCode';
+import { useStockIndex } from '../hooks/useStockIndex';
+import { useUiLanguage } from '../contexts/UiLanguageContext';
 
 // Quick question examples shown on empty state
-const QUICK_QUESTIONS = [
-  { label: '用缠论分析茅台', skill: 'chan_theory' },
-  { label: '波浪理论看宁德时代', skill: 'wave_theory' },
-  { label: '分析比亚迪趋势', skill: 'bull_trend' },
-  { label: '箱体震荡技能看中芯国际', skill: 'box_oscillation' },
-  { label: '分析腾讯 hk00700', skill: 'bull_trend' },
-  { label: '用情绪周期分析东方财富', skill: 'emotion_cycle' },
+type ActiveStockContext = Pick<ChatFollowUpContext, 'stock_code' | 'stock_name'>;
+
+const QUICK_QUESTIONS: Array<{
+  label: string;
+  skill: string;
+  stockContext?: ActiveStockContext;
+}> = [
+  { label: '用缠论分析茅台', skill: 'chan_theory', stockContext: { stock_code: '600519', stock_name: '贵州茅台' } },
+  { label: '波浪理论看宁德时代', skill: 'wave_theory', stockContext: { stock_code: '300750', stock_name: '宁德时代' } },
+  { label: '分析比亚迪趋势', skill: 'bull_trend', stockContext: { stock_code: '002594', stock_name: '比亚迪' } },
+  { label: '用箱体震荡分析 A 股中芯国际 688981', skill: 'box_oscillation', stockContext: { stock_code: '688981', stock_name: '中芯国际' } },
+  { label: '分析腾讯 hk00700', skill: 'bull_trend', stockContext: { stock_code: 'HK00700', stock_name: '腾讯控股' } },
+  { label: '用情绪周期分析东方财富', skill: 'emotion_cycle', stockContext: { stock_code: '300059', stock_name: '东方财富' } },
 ];
 
 const MAX_SELECTED_SKILLS = 3;
 const CONTEXT_COMPRESSION_CONFIG_KEY = 'AGENT_CONTEXT_COMPRESSION_ENABLED';
-const STRONG_COMPARE_STOCK_MESSAGE_RE = /比较|对比|\bvs\b|和[^，。,.!?！？]{0,40}比/i;
-const WEAK_COMPARE_STOCK_MESSAGE_RE = /差异(?!化)|区别|不同|相比|对照|比一比/;
-const CHOICE_COMPARE_STOCK_MESSAGE_RE = /哪个|哪只|哪一个|谁更|更值得|更适合|怎么选|选哪|二选一/;
-const LINKED_COMPARE_STOCK_MESSAGE_RE = /(?:和|与|跟|同)[^，。,.!?！？]{0,40}(?:差异(?!化)|区别|不同|相比|对照|比一比)/;
-const SWITCH_STOCK_MESSAGE_RE = /换成|改看|分析|看看|研究|诊断/;
-
-type ActiveStockContext = Pick<ChatFollowUpContext, 'stock_code' | 'stock_name'>;
-type ActiveStockResolution = {
-  context: ActiveStockContext;
-  useForCurrentSend: boolean;
-};
-
 const getMessageSkillNames = (msg: Message): string[] => {
   if (msg.skillNames?.length) return msg.skillNames;
   if (msg.skillName) return [msg.skillName];
@@ -63,97 +62,31 @@ const getMessageSkillNames = (msg: Message): string[] => {
 
 const getMessageSkillLabel = (msg: Message): string => getMessageSkillNames(msg).join('、');
 
-const isCompareStockMessage = (
-  message: string,
-  stockCodes: string[],
-  currentStockCode?: string | null,
-): boolean => {
-  if (STRONG_COMPARE_STOCK_MESSAGE_RE.test(message)) {
-    return true;
-  }
-  const current = currentStockCode ? normalizeStockCode(currentStockCode) : null;
-  const newStockCodes = current
-    ? stockCodes.filter((code) => code !== current)
-    : stockCodes;
-  if (newStockCodes.length >= 2) {
-    return true;
-  }
-  if (CHOICE_COMPARE_STOCK_MESSAGE_RE.test(message) && stockCodes.length >= 2) {
-    return true;
-  }
-  if (!WEAK_COMPARE_STOCK_MESSAGE_RE.test(message)) {
-    return false;
-  }
-  if (stockCodes.length >= 2) {
-    return true;
-  }
-  if (!currentStockCode) {
-    return false;
-  }
-  const hasNewStock = stockCodes.some((code) => code !== current);
-  return hasNewStock && LINKED_COMPARE_STOCK_MESSAGE_RE.test(message);
+const isStageDoneSuccessful = (status?: string): boolean => {
+  if (!status) return true;
+  const normalized = status.trim().toLowerCase();
+  return ['completed', 'success', 'succeeded', 'done'].includes(normalized);
 };
 
-const resolveActiveStockContextFromMessage = (
-  message: string,
-  currentContext: ActiveStockContext | null,
-): ActiveStockResolution | null => {
-  const stockCodes = extractStockCodesFromMessage(message);
-  const stockCode = stockCodes[0] ?? null;
-  if (!stockCode) {
-    return null;
-  }
-
-  const isCompare = isCompareStockMessage(message, stockCodes, currentContext?.stock_code);
-  const isSwitch = SWITCH_STOCK_MESSAGE_RE.test(message);
-  const currentStockCode = currentContext?.stock_code
-    ? normalizeStockCode(currentContext.stock_code)
-    : null;
-  const newStockCodes = currentStockCode
-    ? stockCodes.filter((code) => code !== currentStockCode)
-    : stockCodes;
-  // Explicit switches can mention the old stock; use the single new code when present.
-  const targetStockCode = isSwitch && newStockCodes.length === 1
-    ? newStockCodes[0]
-    : stockCode;
-  const isDifferentStock = currentStockCode !== targetStockCode;
-
-  // Compare messages and implicit follow-ups must not rewrite the active stock context.
-  if (isCompare || (currentContext && !isSwitch)) {
-    return null;
-  }
-
-  return {
-    context: {
-      stock_code: targetStockCode,
-      stock_name: currentContext && !isDifferentStock
-        ? currentContext.stock_name
-        : null,
-    },
-    // Only explicit switches should affect the context sent with the current request.
-    useForCurrentSend: isSwitch && isDifferentStock,
-  };
+const getStageDoneLabel = (step: ProgressStep): string => {
+  const stage = step.stage || 'stage';
+  if (step.message) return step.message;
+  if (isStageDoneSuccessful(step.status)) return `${stage} completed`;
+  return `${stage} ${step.status || 'finished'}`;
 };
 
-const restoreActiveStockContextFromMessages = (messages: Message[]): ActiveStockContext | null => {
-  let restoredContext: ActiveStockContext | null = null;
-  for (const message of messages) {
-    if (message.role !== 'user') {
-      continue;
-    }
-    const resolution = resolveActiveStockContextFromMessage(message.content, restoredContext);
-    if (resolution) {
-      restoredContext = resolution.context;
-    }
-  }
-  return restoredContext;
+const getPipelineBudgetSkippedLabel = (step: ProgressStep): string => {
+  if (step.message) return step.message;
+  return `${step.stage || 'pipeline'} skipped: insufficient budget`;
 };
 
 const ChatPage: React.FC = () => {
+  const { t } = useUiLanguage();
+  const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const [input, setInput] = useState('');
   const [skills, setSkills] = useState<SkillInfo[]>([]);
-  const [selectedSkillIds, setSelectedSkillIds] = useState<string[]>([]);
+  const [defaultSkillIds, setDefaultSkillIds] = useState<string[]>([]);
   const [showSkillDesc, setShowSkillDesc] = useState<string | null>(null);
   const [mobileSkillPickerOpen, setMobileSkillPickerOpen] = useState(false);
   const [expandedThinking, setExpandedThinking] = useState<Set<string>>(new Set());
@@ -176,8 +109,12 @@ const ChatPage: React.FC = () => {
   const [watchlistCodes, setWatchlistCodes] = useState<string[]>([]);
   const [isWatchlistActioning, setIsWatchlistActioning] = useState(false);
   const [watchlistMessage, setWatchlistMessage] = useState<string | null>(null);
-  const [activeStockCode, setActiveStockCode] = useState<string | null>(null);
-  const [activeStockContext, setActiveStockContext] = useState<ActiveStockContext | null>(null);
+  const [agentStatus, setAgentStatus] = useState<AgentStatusResponse | null>(null);
+  const [agentStatusError, setAgentStatusError] = useState<string | null>(null);
+  const [agentStatusChecking, setAgentStatusChecking] = useState(true);
+  // The registry is used only to validate report hints, never to confirm Chat state.
+  const { index: stockIndex, loading: stockIndexLoading } = useStockIndex();
+
   const watchlistMessageTimerRef = useRef<number | null>(null);
   const copyResetTimerRef = useRef<Partial<Record<string, number>>>({});
   const messagesViewportRef = useRef<HTMLDivElement>(null);
@@ -188,6 +125,7 @@ const ChatPage: React.FC = () => {
   const followUpContextRef = useRef<ChatFollowUpContext | null>(null);
   const shouldStickToBottomRef = useRef(true);
   const pendingScrollBehaviorRef = useRef<ScrollBehavior>('auto');
+  const agentStatusRequestIdRef = useRef(0);
 
   // Get localized text (default to Chinese)
   const text = getReportText('zh');
@@ -212,8 +150,11 @@ const ChatPage: React.FC = () => {
     document.title = '问股 - DSA';
   }, []);
 
-  useEffect(() => () => {
-    isMountedRef.current = false;
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
   }, []);
 
   const loadWatchlist = useCallback(async () => {
@@ -279,30 +220,30 @@ const ChatPage: React.FC = () => {
 
   const {
     messages,
+    selectedSkillIds: sessionSelectedSkillIds,
+    activeStockContext,
+    stateContract,
     loading,
     progressSteps,
     sessionId,
     sessions,
     sessionsLoading,
     chatError,
+    stopping,
+    terminalStatus,
+    stopError,
+    setSelectedSkillIds,
     loadSessions,
     loadInitialSession,
     switchSession,
+    refreshSession,
+    stopStream,
     startStream,
     clearCompletionBadge,
   } = useAgentChatStore();
+  const selectedSkillIds = sessionSelectedSkillIds ?? defaultSkillIds;
 
-  useEffect(() => {
-    if (activeStockContext || messages.length === 0) {
-      return;
-    }
-    const restoredContext = restoreActiveStockContextFromMessages(messages);
-    if (!restoredContext) {
-      return;
-    }
-    setActiveStockContext(restoredContext);
-    setActiveStockCode(restoredContext.stock_code);
-  }, [activeStockContext, messages, sessionId]);
+  const activeStockCode = activeStockContext?.stock_code ?? null;
 
   const syncScrollState = useCallback(() => {
     const viewport = messagesViewportRef.current;
@@ -374,12 +315,36 @@ const ChatPage: React.FC = () => {
           res.default_skill_id ||
           res.skills[0]?.id ||
           '';
-        setSelectedSkillIds(defaultId ? [defaultId] : []);
+        setDefaultSkillIds(defaultId ? [defaultId] : []);
       })
       .catch((error) => {
         console.error('Failed to load chat skills:', error);
       });
   }, []);
+
+  const loadAgentStatus = useCallback(async () => {
+    const requestId = agentStatusRequestIdRef.current + 1;
+    agentStatusRequestIdRef.current = requestId;
+    setAgentStatusChecking(true);
+    try {
+      const status = await agentApi.getStatus();
+      if (!isMountedRef.current || agentStatusRequestIdRef.current !== requestId) return;
+      setAgentStatus(status);
+      setAgentStatusError(null);
+    } catch (error: unknown) {
+      if (!isMountedRef.current || agentStatusRequestIdRef.current !== requestId) return;
+      setAgentStatus(null);
+      setAgentStatusError(getParsedApiError(error).message);
+    } finally {
+      if (isMountedRef.current && agentStatusRequestIdRef.current === requestId) {
+        setAgentStatusChecking(false);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadAgentStatus();
+  }, [loadAgentStatus]);
 
   useEffect(() => {
     let active = true;
@@ -456,6 +421,23 @@ const ChatPage: React.FC = () => {
   const quickQuestions = QUICK_QUESTIONS.filter((question) => availableSkillIds.size === 0 || availableSkillIds.has(question.skill));
   const selectedSkillIdSet = new Set(selectedSkillIds);
   const skillLimitReached = selectedSkillIds.length >= MAX_SELECTED_SKILLS;
+  const agentConfirmedUnavailable = Boolean(agentStatus && !agentStatus.available);
+  const agentAvailable = Boolean(agentStatus?.available) && !agentStatusChecking;
+  const agentUnavailableMessage = agentStatus?.errorCode === 'agent_mode_disabled'
+    ? t('chat.agentModeDisabled')
+    : agentStatus?.errorCode === 'platform_unsupported'
+      ? t('chat.agentPlatformUnsupported')
+      : agentStatus?.backend === 'codex_app_server'
+        ? t('chat.codexUnavailableMessage')
+        : t('chat.defaultUnavailableMessage');
+  const agentUnavailableError = agentConfirmedUnavailable
+    ? createParsedApiError({
+        title: t('chat.agentBackendUnavailableTitle'),
+        message: agentUnavailableMessage,
+        rawMessage: `${agentStatus?.errorCode || 'capability_unsupported'}: ${agentStatus?.message || ''}`,
+        category: 'upstream_network',
+      })
+    : null;
 
   const getSkillNames = useCallback(
     (skillIds: string[]) => skillIds.map((id) => skills.find((s) => s.id === id)?.name || id),
@@ -474,21 +456,17 @@ const ChatPage: React.FC = () => {
   }, []);
 
   const toggleSkillSelection = useCallback((skillId: string) => {
-    setSelectedSkillIds((prev) => {
-      if (prev.includes(skillId)) {
-        return prev.filter((id) => id !== skillId);
-      }
-      if (prev.length >= MAX_SELECTED_SKILLS) {
-        return prev;
-      }
-      return [...prev, skillId];
-    });
-  }, []);
+    if (selectedSkillIds.includes(skillId)) {
+      setSelectedSkillIds(selectedSkillIds.filter((id) => id !== skillId));
+      return;
+    }
+    if (selectedSkillIds.length < MAX_SELECTED_SKILLS) {
+      setSelectedSkillIds([...selectedSkillIds, skillId]);
+    }
+  }, [selectedSkillIds, setSelectedSkillIds]);
 
   const handleStartNewChat = useCallback(() => {
     followUpContextRef.current = null;
-    setActiveStockContext(null);
-    setActiveStockCode(null);
     requestScrollToBottom('auto');
     useAgentChatStore.getState().startNewChat();
     setSidebarOpen(false);
@@ -500,8 +478,6 @@ const ChatPage: React.FC = () => {
       return;
     }
     followUpContextRef.current = null;
-    setActiveStockContext(null);
-    setActiveStockCode(null);
     requestScrollToBottom('auto');
     switchSession(targetSessionId);
     setSidebarOpen(false);
@@ -524,7 +500,33 @@ const ChatPage: React.FC = () => {
 
   // Handle follow-up from report page: ?stock=600519&name=贵州茅台&recordId=xxx
   useEffect(() => {
-    const stock = sanitizeFollowUpStockCode(searchParams.get('stock'));
+    const rawStockCode = searchParams.get('stock');
+    if (!rawStockCode) {
+      // Nothing to follow up — only clear when there actually ARE stale query
+      // params. Skipping the empty case avoids redundant `replace: true`
+      // navigations on every effect re-run (the gate below legitimately re-runs
+      // as status/registry state settles), which would otherwise clobber
+      // subsequent RouterProvider navigation state asserted by other tests.
+      if (searchParams.size === 0) {
+        return;
+      }
+      setSearchParams({}, { replace: true });
+      return;
+    }
+
+    if (stockIndexLoading) {
+      return;
+    }
+    if (agentStatusChecking) {
+      return;
+    }
+
+    // Registry canonical first for explicit index follow-ups (sh000016 /
+    // 000016.SH / 930955.CSI / csi930955) so the report-follow-up canonical is
+    // preserved end-to-end; the sanitize contract is untouched and remains the
+    // stock fail-open when the registry is unavailable or the code unregistered.
+    const registryCanonical = resolveRegisteredIndexCanonical(stockIndex, rawStockCode);
+    const stock = registryCanonical ?? sanitizeFollowUpStockCode(rawStockCode);
     const name = sanitizeFollowUpStockName(searchParams.get('name'));
     const recordId = parseFollowUpRecordId(searchParams.get('recordId'));
 
@@ -535,11 +537,6 @@ const ChatPage: React.FC = () => {
 
     const hydrationToken = ++followUpHydrationTokenRef.current;
     setInput(buildFollowUpPrompt(stock, name));
-    setActiveStockCode(stock);
-    setActiveStockContext({
-      stock_code: stock,
-      stock_name: name,
-    });
     followUpContextRef.current = {
       stock_code: stock,
       stock_name: name,
@@ -551,6 +548,7 @@ const ChatPage: React.FC = () => {
       stockCode: stock,
       stockName: name,
       recordId,
+      index: stockIndex,
     }).then((context) => {
       if (!isMountedRef.current || followUpHydrationTokenRef.current !== hydrationToken) {
         return;
@@ -562,47 +560,50 @@ const ChatPage: React.FC = () => {
       }
     });
     setSearchParams({}, { replace: true });
-  }, [searchParams, setSearchParams]);
+  }, [searchParams, setSearchParams, stockIndex, stockIndexLoading, agentStatusChecking]);
 
   const handleSend = useCallback(
-    async (overrideMessage?: string, overrideSkillIds?: string[]) => {
+    async (
+      overrideMessage?: string,
+      overrideSkillIds?: string[],
+      overrideStockContext?: ActiveStockContext,
+    ) => {
       const msgText = (overrideMessage ?? input).trim();
-      if (!msgText || loading) return;
-      const usedSkillIds = normalizeSelectedSkillIds(overrideSkillIds ?? selectedSkillIds);
-      const usedSkillNames = usedSkillIds.length > 0 ? getSkillNames(usedSkillIds) : ['通用'];
-
-      let nextActiveStockContext = activeStockContext;
-      let useActiveContextForThisSend = false;
-      const stockResolution = resolveActiveStockContextFromMessage(msgText, activeStockContext);
-      if (stockResolution) {
-        nextActiveStockContext = stockResolution.context;
-        useActiveContextForThisSend = stockResolution.useForCurrentSend;
-        setActiveStockContext(nextActiveStockContext);
-        setActiveStockCode(nextActiveStockContext.stock_code);
+      if (!msgText || loading || !agentAvailable || !agentStatus) return;
+      if (overrideMessage !== undefined) {
+        setInput(msgText);
       }
-      const contextForSend = useActiveContextForThisSend
-        ? nextActiveStockContext
-        : followUpContextRef.current ?? nextActiveStockContext ?? undefined;
+      const requestedSkillIds = overrideSkillIds ?? sessionSelectedSkillIds;
+      const usedSkillIds = normalizeSelectedSkillIds(
+        requestedSkillIds ?? selectedSkillIds,
+      );
+      const usedSkillNames = usedSkillIds.length > 0 ? getSkillNames(usedSkillIds) : ['通用'];
+      // Only report/shortcut hints accompany this request. Ordinary follow-ups
+      // rely on the server's accepted state, not a replay or a client-selected fact.
+      const contextForSend = overrideStockContext ?? followUpContextRef.current ?? undefined;
 
       const payload = {
         message: msgText,
         session_id: sessionId,
-        ...(usedSkillIds.length > 0 ? { skills: usedSkillIds } : {}),
+        ...(requestedSkillIds !== null
+          ? { skills: normalizeSelectedSkillIds(requestedSkillIds) }
+          : {}),
         context: contextForSend ?? undefined,
       };
-      followUpHydrationTokenRef.current += 1;
-      followUpContextRef.current = null;
-      setIsFollowUpContextLoading(false);
-
-      setInput('');
-      setMobileSkillPickerOpen(false);
-      requestScrollToBottom('smooth');
       await startStream(payload, {
         skillNames: usedSkillNames,
         skillName: usedSkillNames.join('、'),
+        onAccepted: () => {
+          followUpHydrationTokenRef.current += 1;
+          followUpContextRef.current = null;
+          setIsFollowUpContextLoading(false);
+          setInput('');
+          setMobileSkillPickerOpen(false);
+          requestScrollToBottom('smooth');
+        },
       });
     },
-    [activeStockContext, getSkillNames, input, loading, normalizeSelectedSkillIds, requestScrollToBottom, selectedSkillIds, sessionId, startStream],
+    [agentAvailable, agentStatus, getSkillNames, input, loading, normalizeSelectedSkillIds, requestScrollToBottom, selectedSkillIds, sessionId, sessionSelectedSkillIds, startStream],
   );
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -614,7 +615,7 @@ const ChatPage: React.FC = () => {
 
   const handleQuickQuestion = (q: (typeof QUICK_QUESTIONS)[0]) => {
     setSelectedSkillIds([q.skill]);
-    handleSend(q.label, [q.skill]);
+    handleSend(q.label, [q.skill], q.stockContext);
   };
 
   const showSendFeedback = useCallback((nextToast: { type: 'success' | 'error'; message: string }, durationMs: number) => {
@@ -681,6 +682,14 @@ const ChatPage: React.FC = () => {
       return `${last.display_name || last.tool}...`;
     if (last.type === 'tool_done')
       return `${last.display_name || last.tool} 完成`;
+    if (last.type === 'stage_start')
+      return last.message || `Starting ${last.stage || 'stage'}...`;
+    if (last.type === 'stage_done')
+      return getStageDoneLabel(last);
+    if (last.type === 'pipeline_timeout')
+      return last.message || `${last.stage || 'pipeline'} timed out`;
+    if (last.type === 'pipeline_budget_skipped')
+      return getPipelineBudgetSkippedLabel(last);
     if (last.type === 'generating')
       return last.message || '正在生成最终分析...';
     return '处理中...';
@@ -741,10 +750,29 @@ const ChatPage: React.FC = () => {
           text = `${step.display_name || step.tool} (${step.duration}s)`;
           statusClass = step.success ? 'chat-progress-item-success' : 'chat-progress-item-danger';
           iconClass = step.success ? 'chat-progress-dot-success' : 'chat-progress-dot-danger';
+        } else if (step.type === 'stage_start') {
+          text = step.message || `Starting ${step.stage || 'stage'}...`;
+          statusClass = 'chat-progress-item-thinking';
+          iconClass = 'chat-progress-dot-thinking';
+        } else if (step.type === 'stage_done') {
+          const isSuccess = isStageDoneSuccessful(step.status);
+          text = getStageDoneLabel(step);
+          statusClass = isSuccess ? 'chat-progress-item-success' : 'chat-progress-item-danger';
+          iconClass = isSuccess ? 'chat-progress-dot-success' : 'chat-progress-dot-danger';
+        } else if (step.type === 'pipeline_timeout') {
+          text = step.message || `${step.stage || 'pipeline'} timed out`;
+          statusClass = 'chat-progress-item-danger';
+          iconClass = 'chat-progress-dot-danger';
+        } else if (step.type === 'pipeline_budget_skipped') {
+          text = getPipelineBudgetSkippedLabel(step);
+          statusClass = 'chat-progress-item-muted';
+          iconClass = 'chat-progress-dot-muted';
         } else if (step.type === 'generating') {
           text = step.message || '生成分析';
           statusClass = 'chat-progress-item-generating';
           iconClass = 'chat-progress-dot-generating';
+        } else {
+          text = step.message || step.type;
         }
         return (
           <div
@@ -942,6 +970,14 @@ const ChatPage: React.FC = () => {
                 />
               </svg>
               问股
+              {agentStatus ? (
+                <Badge
+                  variant={agentStatus.backend === 'codex_app_server' ? 'warning' : 'history'}
+                  size="sm"
+                >
+                  {t(agentStatus.backend === 'codex_app_server' ? 'chat.codexBackendBadge' : 'chat.defaultBackendBadge')}
+                </Badge>
+              ) : null}
             </h1>
             {messages.length > 0 && (
               <div className="flex flex-shrink-0 flex-wrap items-center justify-end gap-2">
@@ -1039,8 +1075,25 @@ const ChatPage: React.FC = () => {
             )}
           </div>
           <p className="text-secondary-text text-sm">
-            向 AI 询问个股分析，获取基于技能视角的交易建议与实时决策报告。
+            {t(agentStatus?.backend === 'codex_app_server' ? 'chat.introCodex' : 'chat.introDefault')}
           </p>
+          {agentStatus?.backend === 'codex_app_server' ? (
+            <InlineAlert
+              variant="warning"
+              title={t('chat.codexLimitedTitle')}
+              message={t('chat.codexLimitedMessage')}
+              action={(
+                <Button
+                  variant="action-primary"
+                  size="sm"
+                  onClick={() => navigate('/settings?category=agent')}
+                >
+                  {t('chat.codexChangeBackend')}
+                </Button>
+              )}
+              className="rounded-xl px-3 py-2 text-xs shadow-none"
+            />
+          ) : null}
           {sendToast ? (
             <InlineAlert
               variant={sendToast.type === 'success' ? 'success' : 'danger'}
@@ -1064,7 +1117,11 @@ const ChatPage: React.FC = () => {
               <div className="flex h-full items-center justify-center">
                 <EmptyState
                   title="开始问股"
-                  description="输入「分析 600519」或「茅台现在能买吗」，AI 将调用实时数据工具为您生成决策报告。"
+                  description={t(
+                    agentStatus?.backend === 'codex_app_server'
+                      ? 'chat.emptyDescriptionCodex'
+                      : 'chat.emptyDescriptionDefault',
+                  )}
                   className="max-w-2xl border-dashed bg-card/55"
                   icon={(
                     <svg
@@ -1087,7 +1144,8 @@ const ChatPage: React.FC = () => {
                         <button
                           key={i}
                           onClick={() => handleQuickQuestion(q)}
-                          className="quick-question-btn"
+                          disabled={!agentAvailable}
+                          className="quick-question-btn disabled:cursor-not-allowed disabled:opacity-60"
                         >
                           {q.label}
                         </button>
@@ -1118,9 +1176,9 @@ const ChatPage: React.FC = () => {
                       msg.role === 'user' ? 'chat-bubble-user' : 'chat-bubble-ai'
                     )}
                   >
-                    {msg.role === 'assistant' && skillLabel && (
-                      <div className="mb-2">
-                        <Badge variant="info" className="chat-skill-badge shadow-none" aria-label={`技能 ${skillLabel}`}>
+                    {msg.role === 'assistant' && (skillLabel || msg.backend) && (
+                      <div className="mb-2 flex flex-wrap gap-2">
+                        {skillLabel ? <Badge variant="info" className="chat-skill-badge shadow-none" aria-label={`技能 ${skillLabel}`}>
                           <svg
                             className="w-3 h-3"
                             fill="none"
@@ -1135,7 +1193,12 @@ const ChatPage: React.FC = () => {
                             />
                           </svg>
                           {skillLabel}
-                        </Badge>
+                        </Badge> : null}
+                        {msg.backend ? (
+                          <Badge variant={msg.backend === 'codex_app_server' ? 'warning' : 'history'} size="sm">
+                            {t(msg.backend === 'codex_app_server' ? 'chat.codexBackendBadge' : 'chat.defaultBackendBadge')}
+                          </Badge>
+                        ) : null}
                       </div>
                     )}
                     {msg.role === 'assistant' && renderThinkingBlock(msg)}
@@ -1242,6 +1305,59 @@ const ChatPage: React.FC = () => {
           <div className="border-t border-white/6 bg-card/88 p-4 md:p-6 relative z-20">
             <div className="space-y-3">
               {chatError ? <ApiErrorAlert error={chatError} /> : null}
+              {chatError?.code === 'session_state_conflict' && (
+                <Button variant="secondary" size="xsm" onClick={() => void refreshSession()}>
+                  {t('chat.refreshSession')}
+                </Button>
+              )}
+              {terminalStatus === 'cancelled' ? (
+                <div role="status" className="rounded-xl border border-slate-500/20 bg-slate-500/5 px-4 py-3 text-sm">
+                  {t('chat.analysisStopped')}
+                </div>
+              ) : null}
+              {terminalStatus === 'timeout' ? (
+                <div role="status" className="rounded-xl border border-amber-500/20 bg-amber-500/5 px-4 py-3 text-sm">
+                  {t('chat.analysisTimedOut')}
+                </div>
+              ) : null}
+              {stopError ? (
+                <div role="alert" className="rounded-xl border border-amber-500/20 bg-amber-500/5 px-4 py-3 text-sm">
+                  {t('chat.stopRequestFailed')}
+                </div>
+              ) : null}
+              {agentUnavailableError ? (
+                <div className="space-y-2">
+                  <ApiErrorAlert
+                    error={agentUnavailableError}
+                    actionLabel={t('chat.openAgentSettings')}
+                    onAction={() => navigate('/settings?category=agent')}
+                  />
+                  <Button variant="secondary" size="sm" onClick={() => void loadAgentStatus()}>
+                    {t('chat.recheckAgentStatus')}
+                  </Button>
+                </div>
+              ) : null}
+              {agentStatusError ? (
+                <InlineAlert
+                  variant="warning"
+                  title={t('chat.statusUnavailableTitle')}
+                  message={t('chat.statusUnavailableMessage')}
+                  action={(
+                    <Button variant="secondary" size="sm" onClick={() => void loadAgentStatus()}>
+                      {t('chat.recheckAgentStatus')}
+                    </Button>
+                  )}
+                  className="rounded-xl px-3 py-2 text-xs shadow-none"
+                />
+              ) : null}
+              {agentStatusChecking ? (
+                <InlineAlert
+                  variant="info"
+                  title={t('chat.statusCheckingTitle')}
+                  message={t('chat.statusCheckingMessage')}
+                  className="rounded-xl px-3 py-2 text-xs shadow-none"
+                />
+              ) : null}
               {isFollowUpContextLoading ? (
                 <InlineAlert
                   variant="info"
@@ -1371,7 +1487,12 @@ const ChatPage: React.FC = () => {
                 </div>
               )}
 
-            {activeStockCode && (
+            <div className="text-xs text-muted-text" aria-label={t('chat.currentObjectLabel')}>
+              {activeStockContext
+                ? t('chat.currentObject', { object: `${activeStockContext.stock_name ? `${activeStockContext.stock_name} · ` : ''}${activeStockContext.stock_code}` })
+                : t(stateContract === 'legacy' ? 'chat.objectUnconfirmedLegacy' : 'chat.objectUnconfirmed')}
+            </div>
+            {activeStockCode && activeStockContext?.asset_type === 'stock' && (
               <div className="flex items-center gap-2">
                 <span className="text-xs text-muted-text font-mono">{activeStockCode}</span>
                 <Button
@@ -1395,7 +1516,7 @@ const ChatPage: React.FC = () => {
                   onChange={(e) => setInput(e.target.value)}
                   onKeyDown={handleKeyDown}
                   placeholder="例如：分析 600519 / 茅台现在适合买入吗？ (Enter 发送, Shift+Enter 换行)"
-                  disabled={loading}
+                  disabled={loading || !agentAvailable}
                   rows={1}
                   className="input-surface input-focus-glow flex-1 min-h-[44px] max-h-[200px] rounded-xl border bg-transparent px-4 py-2.5 text-sm transition-all focus:outline-none resize-none disabled:cursor-not-allowed disabled:opacity-60"
                   style={{ height: 'auto' }}
@@ -1405,15 +1526,26 @@ const ChatPage: React.FC = () => {
                     t.style.height = `${Math.min(t.scrollHeight, 200)}px`;
                   }}
                 />
-                <Button
-                  variant="primary"
-                  onClick={() => handleSend()}
-                  disabled={!input.trim() || loading}
-                  isLoading={loading}
-                  className="btn-primary flex-shrink-0"
-                >
-                  发送
-                </Button>
+                {loading && agentStatus?.backend === 'codex_app_server' ? (
+                  <Button
+                    variant="danger-subtle"
+                    onClick={stopStream}
+                    disabled={stopping}
+                    className="flex-shrink-0"
+                  >
+                    {stopping ? t('chat.stoppingAnalysis') : t('chat.stopAnalysis')}
+                  </Button>
+                ) : (
+                  <Button
+                    variant="primary"
+                    onClick={() => handleSend()}
+                    disabled={!input.trim() || loading || !agentAvailable}
+                    isLoading={loading}
+                    className="btn-primary flex-shrink-0"
+                  >
+                    发送
+                  </Button>
+                )}
               </div>
             </div>
           </div>
