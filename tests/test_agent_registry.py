@@ -544,6 +544,8 @@ class TestBuiltinToolDefinitions(unittest.TestCase):
                 "direction_accuracy_pct": 71.0,
                 "avg_stock_return_pct": 6.8,
                 "avg_simulated_return_pct": 8.3,
+                "avg_net_simulated_return_pct": None,
+                "total_transaction_fees": None,
                 "computed_at": "2026-03-20T07:00:00+00:00",
             },
         )

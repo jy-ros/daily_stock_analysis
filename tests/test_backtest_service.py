@@ -2580,7 +2580,10 @@ class BacktestServiceTestCase(unittest.TestCase):
         self.assertEqual(global_summary["total_evaluations"], 1)
         self.assertAlmostEqual(global_summary["win_rate"], 1.0)
         self.assertAlmostEqual(global_summary["direction_accuracy"], 1.0)
-        self.assertAlmostEqual(global_summary["avg_return"], 0.10)
+        # 合并后 Agent memory 优先使用净收益（扣除手续费/滑点），锚定 net 字段的换算结果
+        net_pct = global_summary.get("avg_net_simulated_return_pct")
+        self.assertIsInstance(net_pct, float)
+        self.assertAlmostEqual(global_summary["avg_return"], BacktestService._pct_to_ratio(net_pct))
 
         self.assertIsNotNone(stock_summary)
         self.assertEqual(stock_summary["code"], "600519")

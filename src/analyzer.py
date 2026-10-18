@@ -4903,20 +4903,28 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
         macd_bar_strength = context.get('trend_analysis', {}).get('macd_bar_strength', 1.0)
 
         if macd_7d and isinstance(macd_7d, list) and len(macd_7d) >= 3:
-            prompt += f"""
+            if english:
+                header = """
+### 📊 MACD deep analysis (last 7 trading days)
+| Date | Close | Chg% | DIF | DEA | MACD bar | Bar chg% | Bar dir |
+|------|-------|------|-----|-----|----------|----------|---------|
+"""
+            else:
+                header = """
 ### 📊 MACD 指标深度分析（近7个交易日）
 | 日期 | 收盘价 | 涨跌幅 | DIF | DEA | MACD柱 | MACD柱波动比例 | 柱体方向 |
 |------|--------|--------|-----|-----|--------|----------|----------|
 """
+            prompt += header
             for day in macd_7d[-7:]:
                 bar_dir = "🟥" if day.get('bar_direction') == 'red' else "🟩"
                 chg = f"{day.get('change_pct', ''):+.2f}%" if day.get('change_pct') is not None else "N/A"
                 bar_chg = f"{day.get('bar_change_pct', ''):+.2f}%" if day.get('bar_change_pct') is not None else "N/A"
                 prompt += f"| {day.get('date', '')} | {day.get('close', 0):.2f} | {chg} | {day.get('dif', 0):.4f} | {day.get('dea', 0):.4f} | {day.get('bar', 0):.4f} | {bar_chg} | {bar_dir} |\n"
 
-            # 趋势分析标注
-            if macd_annotations:
-                prompt += f"""
+            # 趋势分析标注（数据驱动文本为中文，仅非英语模板展示）
+            if macd_annotations and not english:
+                prompt += """
 
 **MACD 趋势标注**：
 """
@@ -4925,45 +4933,103 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
 
             # 趋势方向总结
             if macd_trend_dir == "upward" and macd_trend_streak >= 3:
-                prompt += f"""
+                if english:
+                    prompt += f"""
+**Trend conclusion**: MACD-DIF has risen for {macd_trend_streak} consecutive days with expanding red bars; short-term upside momentum is strengthening.
+"""
+                else:
+                    prompt += f"""
 **趋势结论**：MACD-DIF 已连续 {macd_trend_streak} 天上升，MACD 红柱放大，短期上涨动能增强。
 """
                 if macd_dif_chg is not None and macd_dif_chg > 0:
-                    prompt += f"""当日 DIF 变化幅度 {macd_dif_chg:.1f}%，动能持续增强。
+                    if english:
+                        prompt += f"""Today's DIF change is {macd_dif_chg:+.1f}% and momentum keeps strengthening.
+"""
+                    else:
+                        prompt += f"""当日 DIF 变化幅度 {macd_dif_chg:.1f}%，动能持续增强。
 """
                 if macd_turning:
-                    prompt += f"""⚠️ {macd_turning_desc}
+                    if english:
+                        prompt += "⚠️ Turning point detected on the latest MACD bar — momentum may decelerate.\n"
+                    else:
+                        prompt += f"""⚠️ {macd_turning_desc}
 """
             elif macd_trend_dir == "downward" and macd_trend_streak >= 3:
-                prompt += f"""
+                if english:
+                    prompt += f"""
+**Trend conclusion**: MACD-DIF has fallen for {macd_trend_streak} consecutive days with expanding green bars; short-term downside momentum is strengthening.
+"""
+                else:
+                    prompt += f"""
 **趋势结论**：MACD-DIF 已连续 {macd_trend_streak} 天下降，MACD 绿柱放大，短期下跌动能增强。
 """
                 if macd_dif_chg is not None and macd_dif_chg < 0:
-                    prompt += f"""当日 DIF 变化幅度 {abs(macd_dif_chg):.1f}%，动能持续衰减。
+                    if english:
+                        prompt += f"""Today's DIF change is {macd_dif_chg:+.1f}% and momentum keeps weakening.
+"""
+                    else:
+                        prompt += f"""当日 DIF 变化幅度 {abs(macd_dif_chg):.1f}%，动能持续衰减。
 """
                 if macd_turning:
-                    prompt += f"""⚠️ {macd_turning_desc}
+                    if english:
+                        prompt += "⚠️ Turning point detected on the latest MACD bar — momentum may decelerate.\n"
+                    else:
+                        prompt += f"""⚠️ {macd_turning_desc}
 """
             else:
-                prompt += """
+                if english:
+                    prompt += """
+**Trend conclusion**: no sustained MACD trend; the indicator is in a ranging/consolidation phase.
+"""
+                else:
+                    prompt += """
 **趋势结论**：MACD 无明显连续趋势，处于震荡整理阶段。
 """
 
             # 金叉/死叉
             if macd_gc or macd_dc:
-                prompt += f"""
+                if english:
+                    cross_text = (
+                        "Both golden-cross and death-cross signals were detected — treat with caution."
+                        if (macd_gc and macd_dc) else
+                        "Golden cross detected (DIF crossed above DEA)."
+                        if macd_gc else
+                        "Death cross detected (DIF crossed below DEA)."
+                    )
+                    prompt += f"""
+**Cross signal**: {cross_text}
+"""
+                else:
+                    prompt += f"""
 **交叉信号**：{macd_cross_desc}
 """
 
             # 背离检测
             if macd_bearish_div or macd_bullish_div:
-                prompt += f"""
+                if english:
+                    div_text = (
+                        "Divergence signals detected on both sides — treat with caution."
+                        if (macd_bearish_div and macd_bullish_div) else
+                        "Bearish divergence detected — price makes new highs while DIF fails to confirm."
+                        if macd_bearish_div else
+                        "Bullish divergence detected — price makes new lows while DIF fails to confirm."
+                    )
+                    prompt += f"""
+**Divergence**: {div_text}
+"""
+                else:
+                    prompt += f"""
 **背离检测**：{macd_div_desc}
 """
 
             # 柱体强度 & 噪音区
             if macd_is_noisy:
-                prompt += f"""
+                if english:
+                    prompt += f"""
+**Bar strength**: {macd_bar_strength:.2f} — the indicator is in the noise zone; signal reliability is reduced.
+"""
+                else:
+                    prompt += f"""
 **柱体强度**：当前柱体强度 {macd_bar_strength:.2f}，处于噪音区，信号可靠性降低。
 """
 
@@ -4973,11 +5039,27 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
                           "中性/震荡" if macd_composite_score >= 40 else \
                           "偏空" if macd_composite_score >= 20 else \
                           "强烈偏空"
-            prompt += f"""
+            score_level_en = ("strongly bullish" if macd_composite_score >= 80 else
+                              "bullish" if macd_composite_score >= 60 else
+                              "neutral/ranging" if macd_composite_score >= 40 else
+                              "bearish" if macd_composite_score >= 20 else
+                              "strongly bearish")
+            if english:
+                prompt += f"""
+**MACD composite score**: {macd_composite_score}/100 ({score_level_en}; combines DIF trend, bar trend, cross signals, zero-axis position and divergence).
+"""
+            else:
+                prompt += f"""
 **MACD 复合评分**：{macd_composite_score}/100（{score_level}，综合 DIF 趋势、柱体趋势、交叉信号、零轴位置、背离情况）
 """
         else:
-            prompt += """
+            if english:
+                prompt += """
+### 📊 MACD indicator
+> Insufficient data (fewer than 3 trading days); MACD trend analysis unavailable.
+"""
+            else:
+                prompt += """
 ### 📊 MACD 指标
 > 数据不足（少于3个交易日），无法进行 MACD 趋势分析。
 """
@@ -4985,19 +5067,40 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
         # 添加量化辅助指标（Phase 1：KDJ/BOLL/ATR/波动率/回撤/VaR）
         quant = context.get('trend_analysis', {}).get('quant')
         if quant and isinstance(quant, dict):
-            prompt += (
-                f"\n### 🧮 量化辅助指标\n"
-                f"- KDJ({_safe_float(quant.get('kdj_k')):.1f}/"
-                f"{_safe_float(quant.get('kdj_d')):.1f}/"
-                f"{_safe_float(quant.get('kdj_j')):.1f}) 状态：{quant.get('kdj_status', '中性')}\n"
-                f"- BOLL 带内位置：{_safe_float(quant.get('boll_position')):.0f}/100"
-                f"（带宽 {_safe_float(quant.get('boll_width_pct')):.1f}%）\n"
-                f"- ATR 平均日内波幅：{_safe_float(quant.get('atr_pct')):.1f}%（占收盘价）\n"
-                f"- 20 日年化波动率：{_safe_float(quant.get('vol_20d')):.1f}%\n"
-                f"- 60 日最大回撤：{_safe_float(quant.get('max_drawdown_60d')):.1f}%\n"
-                f"- 95% 单日 VaR：{_safe_float(quant.get('var_95_1d')):.1f}%\n"
-                f"- 风险等级：{quant.get('risk_level', '低')}"
-            )
+            if english:
+                risk_level_en = {'低': 'Low', '中': 'Medium', '高': 'High'}.get(
+                    str(quant.get('risk_level', '')), quant.get('risk_level', ''))
+                kdj_status_en = {"中性": "neutral", "超买": "overbought", "超卖": "oversold",
+                                 "金叉": "golden cross", "死叉": "death cross",
+                                 "多头": "bullish", "空头": "bearish"}.get(
+                    str(quant.get('kdj_status', '')), quant.get('kdj_status', ''))
+                prompt += (
+                    f"\n### 🧮 Auxiliary quant indicators\n"
+                    f"- KDJ({_safe_float(quant.get('kdj_k')):.1f}/"
+                    f"{_safe_float(quant.get('kdj_d')):.1f}/"
+                    f"{_safe_float(quant.get('kdj_j')):.1f}) status: {kdj_status_en}\n"
+                    f"- BOLL band position: {_safe_float(quant.get('boll_position')):.0f}/100"
+                    f" (band width {_safe_float(quant.get('boll_width_pct')):.1f}%)\n"
+                    f"- ATR average intraday range: {_safe_float(quant.get('atr_pct')):.1f}% of close\n"
+                    f"- 20-day annualized volatility: {_safe_float(quant.get('vol_20d')):.1f}%\n"
+                    f"- 60-day max drawdown: {_safe_float(quant.get('max_drawdown_60d')):.1f}%\n"
+                    f"- 95% 1-day VaR: {_safe_float(quant.get('var_95_1d')):.1f}%\n"
+                    f"- Risk level: {risk_level_en}"
+                )
+            else:
+                prompt += (
+                    f"\n### 🧮 量化辅助指标\n"
+                    f"- KDJ({_safe_float(quant.get('kdj_k')):.1f}/"
+                    f"{_safe_float(quant.get('kdj_d')):.1f}/"
+                    f"{_safe_float(quant.get('kdj_j')):.1f}) 状态：{quant.get('kdj_status', '中性')}\n"
+                    f"- BOLL 带内位置：{_safe_float(quant.get('boll_position')):.0f}/100"
+                    f"（带宽 {_safe_float(quant.get('boll_width_pct')):.1f}%）\n"
+                    f"- ATR 平均日内波幅：{_safe_float(quant.get('atr_pct')):.1f}%（占收盘价）\n"
+                    f"- 20 日年化波动率：{_safe_float(quant.get('vol_20d')):.1f}%\n"
+                    f"- 60 日最大回撤：{_safe_float(quant.get('max_drawdown_60d')):.1f}%\n"
+                    f"- 95% 单日 VaR：{_safe_float(quant.get('var_95_1d')):.1f}%\n"
+                    f"- 风险等级：{quant.get('risk_level', '低')}"
+                )
 
         # 添加昨日对比数据
         if 'yesterday' in context:
