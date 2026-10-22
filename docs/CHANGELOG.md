@@ -14,8 +14,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - [改进] 合并上游 ZhuLinsen/daily_stock_analysis main 最新改动（约 217 个提交：ETF 双动量轮动、数据中心/选股 API、pr-review 重构、ci_gate pytest 超时与分片护栏等），并保留本地 MACD 深度分析、量化辅助指标与回测手续费/滑点配置；ci_gate 在上游超时护栏基础上保留本地 pytest-html/coverage 报告与失败重试
 - [修复] 合并后离线测试回归修复：en/ko 提示词为本地 MACD/量化段落补充英文分支（ko 复用英文脚手架）、补齐 ko 报告标签 macd*/quant* 键、注册 BACKTEST_COMMISSION_RATE/MIN_COMMISSION/SLIPPAGE_PCT 三个配置项、Agent 学习摘要净收益断言与回测基准抓取相关测试契约对齐
-- [修复] 修复每日分析 workflow 定时触发自 2026-10-09 起失效的问题：GitHub 侧 schedule 注册丢失（配置与开关均正常），通过推送 workflow 文件变更强制重新注册调度
-- [新功能] 每日分析 workflow 新增图表生成步骤（基于 scripts/generate_report_charts.py 从 reports/report_YYYYMMDD.json 生成 PNG）、安装 CJK 字体保证中文渲染、报告邮件内嵌图表 base64 图片
 
 ## [3.33.0] - 2026-10-15
 
