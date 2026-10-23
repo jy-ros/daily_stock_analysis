@@ -11,6 +11,7 @@ A股自选股智能分析系统 - 核心分析流水线
 4. 提供股票分析的核心功能
 """
 
+import json
 import logging
 import inspect
 import threading
@@ -3821,6 +3822,7 @@ class StockAnalysisPipeline:
                 filepath = str(filepath)
                 self._last_local_report_path = filepath
                 logger.info(f"决策仪表盘日报已保存: {filepath}")
+                self._save_report_json(results)
                 return filepath
             self._last_local_report_error = "notifier returned empty report path"
             logger.error("保存本地报告失败: 通知服务未返回报告路径")
@@ -3845,6 +3847,22 @@ class StockAnalysisPipeline:
         """Build default local report filename (aligned with notifier defaults)."""
         date_str = datetime.now().strftime('%Y%m%d')
         return f"report_{date_str}.md"
+
+    def _save_report_json(self, results: List[AnalysisResult]) -> None:
+        """导出分析结果 JSON 供图表生成脚本消费（失败不影响主流程）。"""
+        try:
+            reports_dir = Path(__file__).resolve().parents[2] / "reports"
+            reports_dir.mkdir(parents=True, exist_ok=True)
+            today = datetime.now().strftime("%Y%m%d")
+            json_path = reports_dir / f"report_{today}.json"
+            data = [r.to_dict() for r in results]
+            json_path.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
+            logger.info(f"分析数据 JSON 已导出: {json_path}")
+        except Exception as e:
+            logger.error(f"导出分析 JSON 失败（不影响报告主流程）: {e}")
 
     @staticmethod
     def _report_output_dir() -> Path:
